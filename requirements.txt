@@ -1,0 +1,15 @@
+# ── Core ──
+numpy
+requests
+rich>=13.0
+elasticsearch[async]>=8.0
+qdrant-client>=1.7
+
+# ── Data ──
+pyarrow                     # Parquet 파일 지원 (--parquet 사용 시 필요)
+
+# ── Model Serving (KServe + ONNX) ──
+torch>=2.0
+transformers>=4.36
+onnxruntime
+kserve
