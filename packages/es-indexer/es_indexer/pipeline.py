@@ -35,6 +35,7 @@ from kserve_embed_client import (
     AsyncFailureLogger,
     PipelineStats,
     batch_iter,
+    get_logger,
     load_keywords,
     timer,
 )
@@ -42,8 +43,9 @@ from kserve_embed_client import (
 from .config import Config
 from .indexer import ESIndexer
 
+_PKG = "es_indexer"
 console = Console()
-logger = logging.getLogger("es_indexer")
+logger = get_logger(_PKG, "pipeline")
 
 
 # ============================================================
@@ -54,8 +56,10 @@ def _setup_logger(config: Config, log_path: Path | None, prefix: str) -> Path:
     RichHandler (콘솔) + FileHandler (파일) 듀얼 로깅.
 
     하나의 logger.info()로 콘솔(Rich 포맷)과 파일(plain text)에 동시 기록.
+    패키지 루트 로거(es_indexer)에 핸들러를 설정하므로 서브 로거에도 전파됨.
     """
-    logger.handlers.clear()
+    pkg_logger = logging.getLogger(_PKG)
+    pkg_logger.handlers.clear()
 
     if log_path is None:
         log_path = config.keywords_path.parent.parent / "logs"
@@ -65,7 +69,7 @@ def _setup_logger(config: Config, log_path: Path | None, prefix: str) -> Path:
     # File handler — plain text + timestamp
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
-    logger.addHandler(fh)
+    pkg_logger.addHandler(fh)
 
     # Rich handler — formatted console
     rh = RichHandler(
@@ -76,9 +80,9 @@ def _setup_logger(config: Config, log_path: Path | None, prefix: str) -> Path:
         rich_tracebacks=True,
     )
     rh.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(rh)
+    pkg_logger.addHandler(rh)
 
-    logger.setLevel(logging.INFO)
+    pkg_logger.setLevel(logging.INFO)
     logger.info(f"config: {config}")
     return log_file
 
@@ -367,11 +371,11 @@ async def _run_realtime(config: Config, log_path: Path | None = None):
     # 샘플 검색
     sample = keywords[0] if keywords else ""
     if sample:
-        results = await indexer.search(sample, size=3)
+        results = await indexer.search(sample, size=3, field=config.source_key)
         hits = results["hits"]["hits"]
         logger.info(f"실시간 검색 확인 \u2014 쿼리: {sample}")
         for hit in hits:
-            logger.info(f"  score={hit['_score']:.4f}  {hit['_source']['keyword']}")
+            logger.info(f"  score={hit['_score']:.4f}  {hit['_source'].get(config.source_key, hit['_source'])}")
 
     await indexer.close()
     logger.info("완료")

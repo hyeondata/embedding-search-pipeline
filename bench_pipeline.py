@@ -24,29 +24,10 @@ from elasticsearch.helpers import async_bulk
 
 from es_indexer import ESIndexer
 from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
+from link_products_to_keywords import PRODUCT_KEYWORDS_SCHEMA
 from qdrant_indexer import AsyncQdrantIndexer, QdrantIndexer
 
 QUERY_PREFIX = RURI_QUERY_PREFIX
-
-PRODUCT_KEYWORDS_SCHEMA = {
-    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-    "mappings": {
-        "properties": {
-            "product_name": {
-                "type": "text",
-                "fields": {"raw": {"type": "keyword"}},
-            },
-            "keywords": {
-                "type": "nested",
-                "properties": {
-                    "keyword": {"type": "text", "fields": {"raw": {"type": "keyword"}}},
-                    "keyword_id": {"type": "integer"},
-                    "score": {"type": "float"},
-                },
-            },
-        }
-    },
-}
 
 
 # ============================================================

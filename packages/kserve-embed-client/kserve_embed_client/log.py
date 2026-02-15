@@ -35,7 +35,7 @@ class _PlainFormatter(logging.Formatter):
         original_msg = record.msg
         try:
             record.msg = Text.from_markup(str(record.msg)).plain
-        except Exception:
+        except (ValueError, KeyError, AttributeError):
             pass
         result = super().format(record)
         record.msg = original_msg
