@@ -1,15 +1,20 @@
-"""텍스트 쿼리 → 임베딩 → Qdrant top-k 검색 (단건 + 대용량 배치)"""
+"""텍스트 쿼리 → 임베딩 → Qdrant top-k 검색 (단건 + 대용량 배치)
+
+embed_fn (Callable[[list[str]], np.ndarray])을 외부에서 주입받아
+EmbeddingClient에 대한 직접 의존을 제거.
+"""
 
 import asyncio
 import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from kserve_embed_client import (
-    EmbeddingClient,
+import numpy as np
+
+from pipeline_commons import (
     PipelineStats,
-    RURI_QUERY_PREFIX,
     batch_iter,
     get_logger,
     setup_logging,
@@ -22,18 +27,13 @@ from .indexer import AsyncQdrantIndexer, QdrantIndexer
 _PKG = "qdrant_indexer"
 logger = get_logger(_PKG, "searcher")
 
+# ── 타입 별칭 ────────────────────────────────────
+EmbedFn = Callable[[list[str]], np.ndarray]
+
 
 @dataclass
 class SearchResult:
-    """검색 결과 1건.
-
-    Attributes:
-        rank: 순위 (1부터 시작).
-        score: 유사도 점수.
-        keyword: payload에서 payload_key로 추출한 텍스트 (하위호환).
-        point_id: Qdrant 포인트 ID.
-        payload: 전체 Qdrant payload 딕셔너리.
-    """
+    """검색 결과 1건."""
     rank: int
     score: float
     keyword: str
@@ -45,43 +45,32 @@ class Searcher:
     """
     텍스트 쿼리로 Qdrant에서 유사 키워드를 검색.
 
-    ruri-v3 비대칭 임베딩:
-      - 검색 쿼리: "検索クエリ: " prefix
-      - 검색 문서: "検索文書: " prefix
-      - 의미적 인코딩: prefix 없음
-
     사용법:
-        searcher = Searcher(config)
+        searcher = Searcher(config, embed_fn=client.embed, query_prefix="検索クエリ: ")
         results = searcher.search("東京 ラーメン", top_k=10)
-        for r in results:
-            print(f"#{r.rank} score={r.score:.4f} {r.keyword}")
     """
 
-    QUERY_PREFIX = RURI_QUERY_PREFIX
-
-    def __init__(self, config: Config = None, *, payload_key: str = None):
+    def __init__(
+        self,
+        config: Config = None,
+        *,
+        embed_fn: EmbedFn,
+        query_prefix: str = "",
+        payload_key: str = None,
+    ):
         config = config or Config()
-        self.embedder = EmbeddingClient(config.kserve_url, config.model_name)
+        self.embed_fn = embed_fn
+        self.query_prefix = query_prefix
         self.indexer = QdrantIndexer(config.qdrant_url, config.collection_name, config.vector_dim)
         self.payload_key = payload_key or config.payload_key
 
     def search(self, query: str, top_k: int = 5, prefix: str = None) -> list[SearchResult]:
-        """
-        텍스트 쿼리 → 임베딩 → top-k 유사도 검색
-
-        Args:
-            query:  검색할 텍스트
-            top_k:  반환할 결과 수
-            prefix: 쿼리 prefix (기본: "検索クエリ: ")
-
-        Returns:
-            SearchResult 리스트 (score 내림차순)
-        """
+        """텍스트 쿼리 → 임베딩 → top-k 유사도 검색."""
         if prefix is None:
-            prefix = self.QUERY_PREFIX
+            prefix = self.query_prefix
         prefixed = f"{prefix}{query}"
 
-        embedding = self.embedder.embed([prefixed])
+        embedding = self.embed_fn([prefixed])
         response = self.indexer.search(embedding[0].tolist(), top_k=top_k)
 
         return [
@@ -96,23 +85,12 @@ class Searcher:
         ]
 
     def search_batch(self, queries: list[str], top_k: int = 5, prefix: str = None) -> dict[str, list[SearchResult]]:
-        """
-        여러 쿼리를 한 번에 검색.
-        임베딩 1회 + query_batch_points 1회로 처리.
-
-        Args:
-            queries: 검색할 텍스트 리스트
-            top_k:   각 쿼리당 반환할 결과 수
-            prefix:  쿼리 prefix (기본: "検索クエリ: ")
-
-        Returns:
-            {쿼리 텍스트: [SearchResult, ...]} 딕셔너리
-        """
+        """여러 쿼리를 한 번에 검색."""
         if prefix is None:
-            prefix = self.QUERY_PREFIX
+            prefix = self.query_prefix
         prefixed = [f"{prefix}{q}" for q in queries]
 
-        embeddings = self.embedder.embed(prefixed)
+        embeddings = self.embed_fn(prefixed)
 
         vectors = [embeddings[i].tolist() for i in range(len(queries))]
         responses = self.indexer.search_batch(vectors, top_k=top_k)
@@ -138,7 +116,7 @@ class Searcher:
 
 async def _async_search_batch(
     queries: list[str],
-    embedder: EmbeddingClient,
+    embed_fn: EmbedFn,
     async_indexer: AsyncQdrantIndexer,
     top_k: int,
     prefix: str,
@@ -151,7 +129,7 @@ async def _async_search_batch(
     prefixed = [f"{prefix}{q}" for q in queries]
 
     with timer() as t_embed:
-        embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
+        embeddings = await loop.run_in_executor(None, embed_fn, prefixed)
 
     with timer() as t_search:
         vectors = [embeddings[i].tolist() for i in range(len(queries))]
@@ -182,12 +160,13 @@ async def _async_search_batch(
 async def _run_async_batch_search(
     config: Config,
     queries: list[str],
+    embed_fn: EmbedFn,
     top_k: int,
     output_path: Path,
     stats: PipelineStats,
+    query_prefix: str,
 ):
     """asyncio 이벤트 루프에서 배치 검색 실행"""
-    embedder = EmbeddingClient(config.kserve_url, config.model_name)
     async_indexer = AsyncQdrantIndexer(config.qdrant_url, config.collection_name, config.vector_dim)
     loop = asyncio.get_running_loop()
 
@@ -200,8 +179,8 @@ async def _run_async_batch_search(
         async def bounded_search(batch):
             async with sem:
                 await _async_search_batch(
-                    batch, embedder, async_indexer, top_k,
-                    Searcher.QUERY_PREFIX, payload_key, stats, out_file, loop,
+                    batch, embed_fn, async_indexer, top_k,
+                    query_prefix, payload_key, stats, out_file, loop,
                 )
 
         await asyncio.gather(*[bounded_search(batch) for batch in batches])
@@ -212,6 +191,9 @@ async def _run_async_batch_search(
 def run_batch_search(
     config: Config,
     queries_path: Path,
+    embed_fn: EmbedFn,
+    *,
+    query_prefix: str = "",
     output_path: Path = None,
     top_k: int = 10,
     limit: int = 0,
@@ -257,11 +239,12 @@ def run_batch_search(
         f"batch=[cyan]{config.batch_size}[/cyan], top_k=[cyan]{top_k}[/cyan])"
     )
     logger.info(f"Qdrant 벡터: [cyan]{vec_count:,}[/cyan]건")
-    logger.info("query_batch_points + AsyncQdrantClient")
 
     stats = PipelineStats(total, log_fn=logger.info, unit="q/s")
 
-    asyncio.run(_run_async_batch_search(config, queries, top_k, output_path, stats))
+    asyncio.run(_run_async_batch_search(
+        config, queries, embed_fn, top_k, output_path, stats, query_prefix,
+    ))
 
     wall = stats.wall_sec
 

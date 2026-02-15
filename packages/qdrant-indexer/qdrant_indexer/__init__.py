@@ -1,27 +1,20 @@
 """
-qdrant-indexer — KServe 임베딩 + Qdrant 벡터 인덱싱 + 검색 패키지
+qdrant-indexer — Qdrant 벡터 인덱싱 + 검색 패키지
 
 사용법:
+    from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
     from qdrant_indexer import QdrantIndexer, Searcher, run_indexing, Config
 
-    # Bulk 인덱싱 (컬렉션 재생성)
+    # 임베딩 클라이언트 생성 (별도 패키지)
+    client = EmbeddingClient("http://localhost:8000", "ruri_v3")
+
+    # Bulk 인덱싱 (embed_fn 주입)
     config = Config(limit=100, workers=4)
-    run_indexing(config)
+    run_indexing(config, embed_fn=client.embed, query_prefix=RURI_QUERY_PREFIX)
 
-    # Realtime 인덱싱 (기존 보존 + 증분)
-    from qdrant_indexer import run_realtime
-    run_realtime(config)
-
-    # 검색 (단건)
-    searcher = Searcher(config)
+    # 검색 (embed_fn 주입)
+    searcher = Searcher(config, embed_fn=client.embed, query_prefix=RURI_QUERY_PREFIX)
     results = searcher.search("東京 ラーメン", top_k=10)
-
-    # 검색 (대용량 배치)
-    from qdrant_indexer import run_batch_search
-    run_batch_search(config, Path("data/keywords_400k.txt"), top_k=10)
-
-    # 임베딩 클라이언트 (kserve-embed-client에서 re-export)
-    from kserve_embed_client import EmbeddingClient
 """
 
 from .config import Config

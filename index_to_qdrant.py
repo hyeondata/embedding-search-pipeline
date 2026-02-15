@@ -4,7 +4,7 @@
 키워드 → KServe 임베딩 → Qdrant 인덱싱 (CLI 엔트리포인트)
 
 사전 조건:
-  1. KServe 서버:  python kserve_server.py --http_port 8080
+  1. KServe 서버:  Triton 또는 KServe 추론 서버 실행 중
   2. Qdrant:       docker compose up -d
 
 실행:
@@ -14,8 +14,6 @@
 
   # Parquet 파일
   python index_to_qdrant.py --parquet data/keywords.parquet --parquet_column keyword
-  python index_to_qdrant.py --parquet data/large.parquet --parquet_chunk_size 50000 --limit 100000
-  python index_to_qdrant.py --parquet data/keywords.parquet --max_retries 5 --no_log_failures
 """
 
 import argparse
@@ -23,6 +21,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
 from qdrant_indexer import Config, run_indexing
 
 console = Console()
@@ -42,6 +41,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64, help="임베딩 배치 크기 (기본: 64)")
     parser.add_argument("--workers", type=int, default=4, help="동시 워커 수 (기본: 4)")
     parser.add_argument("--collection", default="keywords", help="Qdrant 컬렉션 이름")
+
+    # KServe
+    parser.add_argument("--kserve_url", default="http://localhost:8000", help="KServe 서비스 URL")
+    parser.add_argument("--model_name", default="ruri_v3", help="모델 이름")
 
     # 재시도
     parser.add_argument("--max_retries", type=int, default=3, help="배치당 최대 재시도 횟수 (기본: 3)")
@@ -80,9 +83,12 @@ def main():
 
     config = Config(**config_kwargs)
 
+    # 임베딩 클라이언트 생성
+    client = EmbeddingClient(args.kserve_url, args.model_name)
+
     console.rule("[bold]키워드 임베딩 → Qdrant 인덱싱 (Concurrent + Retry)[/bold]")
 
-    run_indexing(config)
+    run_indexing(config, embed_fn=client.embed, query_prefix=RURI_QUERY_PREFIX)
 
 
 if __name__ == "__main__":

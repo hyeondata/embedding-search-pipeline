@@ -1,20 +1,24 @@
 """비동기 인덱싱 파이프라인 (Parquet 지원 + 재시도 + 실패 로깅)
 
-EmbeddingClient.embed() — sync (requests) → run_in_executor로 비동기화
-AsyncQdrantIndexer     — 네이티브 async (httpx 기반 AsyncQdrantClient)
-동시성 제어           — asyncio.Semaphore (config.workers)
+embed_fn (Callable[[list[str]], np.ndarray])을 외부에서 주입받아
+EmbeddingClient에 대한 직접 의존을 제거.
+
+embed_fn은 sync 함수 → run_in_executor로 비동기화
+AsyncQdrantIndexer는 네이티브 async (httpx 기반)
+동시성 제어는 asyncio.Semaphore (config.workers)
 """
 
 import asyncio
 import time
 from pathlib import Path
+from typing import Callable
 
-from kserve_embed_client import (
+import numpy as np
+
+from pipeline_commons import (
     AsyncFailureLogger,
-    EmbeddingClient,
     PipelineStats,
     ParquetReader,
-    RURI_QUERY_PREFIX,
     batch_iter,
     get_logger,
     load_keywords,
@@ -29,25 +33,24 @@ _PKG = "qdrant_indexer"
 logger = get_logger(_PKG, "pipeline")
 
 
+# ── 타입 별칭 ────────────────────────────────────
+EmbedFn = Callable[[list[str]], np.ndarray]
+
+
 # ============================================================
 # 배치 처리 코루틴
 # ============================================================
 async def _process_batch(
     batch_id: int,
     keywords: list[str],
-    embedder: EmbeddingClient,
+    embed_fn: EmbedFn,
     indexer: AsyncQdrantIndexer,
     semaphore: asyncio.Semaphore,
     stats: PipelineStats,
     config: Config,
     failure_logger: AsyncFailureLogger,
 ):
-    """
-    단일 배치: 임베딩(executor) → Qdrant upsert(async) + 재시도.
-
-    EmbeddingClient.embed()은 sync(requests)이므로 run_in_executor로 실행.
-    AsyncQdrantIndexer.upsert_batch()는 네이티브 async.
-    """
+    """단일 배치: 임베딩(executor) → Qdrant upsert(async) + 재시도."""
     async with semaphore:
         last_error: Exception | None = None
 
@@ -57,7 +60,7 @@ async def _process_batch(
 
                 with timer() as t_embed:
                     embeddings = await loop.run_in_executor(
-                        None, embedder.embed, keywords
+                        None, embed_fn, keywords
                     )
 
                 with timer() as t_upsert:
@@ -97,7 +100,13 @@ async def _process_batch(
 # ============================================================
 # 메인 파이프라인 (비동기)
 # ============================================================
-async def _run_indexing(config: Config, log_path: Path = None):
+async def _run_indexing(
+    config: Config,
+    embed_fn: EmbedFn,
+    *,
+    log_path: Path = None,
+    query_prefix: str = "",
+):
     """
     전체 인덱싱 파이프라인 (비동기):
       1. 키워드 로드 (텍스트 파일 또는 Parquet)
@@ -169,7 +178,6 @@ async def _run_indexing(config: Config, log_path: Path = None):
         f"[bold]\\[3/{total_steps}] 비동기 인덱싱[/bold] "
         f"(workers=[cyan]{config.workers}[/cyan], batch=[cyan]{config.batch_size}[/cyan])"
     )
-    embedder = EmbeddingClient(config.kserve_url, config.model_name)
     stats = PipelineStats(total, log_fn=logger.info)
     semaphore = asyncio.Semaphore(config.workers)
 
@@ -184,7 +192,7 @@ async def _run_indexing(config: Config, log_path: Path = None):
 
     await asyncio.gather(*[
         _process_batch(
-            bid, batch, embedder, indexer, semaphore,
+            bid, batch, embed_fn, indexer, semaphore,
             stats, config, failure_logger,
         )
         for bid, batch in batches
@@ -215,7 +223,7 @@ async def _run_indexing(config: Config, log_path: Path = None):
     query = "東京 ラーメン おすすめ"
     loop = asyncio.get_running_loop()
     query_emb = await loop.run_in_executor(
-        None, embedder.embed, [f"{RURI_QUERY_PREFIX}{query}"]
+        None, embed_fn, [f"{query_prefix}{query}"]
     )
     results = await indexer.search(query_emb[0].tolist(), top_k=5)
 
@@ -230,19 +238,14 @@ async def _run_indexing(config: Config, log_path: Path = None):
 # ============================================================
 # Realtime 파이프라인 (비동기)
 # ============================================================
-async def _run_realtime(config: Config, log_path: Path = None):
-    """
-    실시간 인덱싱 파이프라인 (비동기) — 기존 컬렉션 보존 + 증분 적재:
-      1. 키워드 로드 (텍스트 파일 또는 Parquet)
-      2. Qdrant 컬렉션 보존 (없으면 생성)
-      3. 비동기 배치 처리 (embed via executor + upsert async + 재시도)
-      4. 검증 + 샘플 검색
-
-    run_indexing()과의 차이:
-      - 컬렉션을 삭제하지 않고 기존 데이터 보존
-      - ID를 기존 포인트 수부터 시작하여 충돌 방지
-      - bulk_mode 최적화 비적용 (HNSW 인덱싱 활성 상태 유지)
-    """
+async def _run_realtime(
+    config: Config,
+    embed_fn: EmbedFn,
+    *,
+    log_path: Path = None,
+    query_prefix: str = "",
+):
+    """실시간 인덱싱 파이프라인 (비동기) — 기존 컬렉션 보존 + 증분 적재."""
     # 로그 파일 설정
     if log_path is None:
         log_path = (
@@ -302,7 +305,6 @@ async def _run_realtime(config: Config, log_path: Path = None):
         f"(workers=[cyan]{config.workers}[/cyan], batch=[cyan]{config.batch_size}[/cyan], "
         f"id_offset=[cyan]{id_offset:,}[/cyan])"
     )
-    embedder = EmbeddingClient(config.kserve_url, config.model_name)
     stats = PipelineStats(total, log_fn=logger.info)
     semaphore = asyncio.Semaphore(config.workers)
 
@@ -317,7 +319,7 @@ async def _run_realtime(config: Config, log_path: Path = None):
 
     await asyncio.gather(*[
         _process_batch(
-            bid, batch, embedder, indexer, semaphore,
+            bid, batch, embed_fn, indexer, semaphore,
             stats, config, failure_logger,
         )
         for bid, batch in batches
@@ -339,7 +341,7 @@ async def _run_realtime(config: Config, log_path: Path = None):
     query = "東京 ラーメン おすすめ"
     loop = asyncio.get_running_loop()
     query_emb = await loop.run_in_executor(
-        None, embedder.embed, [f"{RURI_QUERY_PREFIX}{query}"]
+        None, embed_fn, [f"{query_prefix}{query}"]
     )
     results = await indexer.search(query_emb[0].tolist(), top_k=5)
 
@@ -354,11 +356,23 @@ async def _run_realtime(config: Config, log_path: Path = None):
 # ============================================================
 # Public API — 동기 래퍼
 # ============================================================
-def run_indexing(config: Config, log_path: Path | None = None):
+def run_indexing(
+    config: Config,
+    embed_fn: EmbedFn,
+    *,
+    log_path: Path | None = None,
+    query_prefix: str = "",
+):
     """Bulk 모드 — 컬렉션 재생성 후 대량 적재 (동기 래퍼)"""
-    asyncio.run(_run_indexing(config, log_path))
+    asyncio.run(_run_indexing(config, embed_fn, log_path=log_path, query_prefix=query_prefix))
 
 
-def run_realtime(config: Config, log_path: Path | None = None):
+def run_realtime(
+    config: Config,
+    embed_fn: EmbedFn,
+    *,
+    log_path: Path | None = None,
+    query_prefix: str = "",
+):
     """Realtime 모드 — 기존 컬렉션 보존 + 증분 적재 (동기 래퍼)"""
-    asyncio.run(_run_realtime(config, log_path))
+    asyncio.run(_run_realtime(config, embed_fn, log_path=log_path, query_prefix=query_prefix))

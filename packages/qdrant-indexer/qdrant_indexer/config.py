@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kserve_embed_client import BaseConfig
+from pipeline_commons import BaseConfig
 
 
 @dataclass
@@ -12,10 +12,6 @@ class Config(BaseConfig):
     keywords_path: Path = field(
         default_factory=lambda: Path(__file__).parent.parent / "data" / "keywords_400k.txt"
     )
-
-    # KServe 임베딩
-    kserve_url: str = "http://localhost:8080"
-    model_name: str = "ruri_v3"
 
     # Qdrant
     qdrant_url: str = "http://localhost:6333"

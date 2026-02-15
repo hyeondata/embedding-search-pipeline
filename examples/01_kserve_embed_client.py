@@ -17,8 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from kserve_embed_client import (
-    EmbeddingClient,
+from kserve_embed_client import EmbeddingClient
+from pipeline_commons import (
     FailureLogger,
     ParquetReader,
     RetryConfig,
@@ -29,14 +29,16 @@ from kserve_embed_client import (
 )
 
 
-def test_embedding_client():
-    """EmbeddingClient: Mock HTTP로 KServe V2 응답 파싱 검증"""
+def test_embedding_client_text_mode():
+    """EmbeddingClient: 텍스트 모드 (tokenizer_name=None) — Mock HTTP로 V2 BYTES 검증"""
     print("=" * 60)
-    print("[1] EmbeddingClient — Mock embed()")
+    print("[1] EmbeddingClient — 텍스트 모드 (tokenizer_name=None)")
     print("=" * 60)
 
-    client = EmbeddingClient("http://localhost:8080", "ruri_v3")
+    client = EmbeddingClient("http://localhost:8080", "ruri_v3", tokenizer_name=None)
+    assert client.tokenizer is None
     print(f"  URL: {client.url}")
+    print(f"  tokenizer: None (텍스트 모드)")
 
     # Mock KServe V2 응답: 3개 텍스트 → (3, 768) 임베딩
     mock_embeddings = np.random.randn(3, 768).tolist()
@@ -58,7 +60,7 @@ def test_embedding_client():
         texts = ["東京の天気", "大阪のグルメ", "京都の寺院"]
         result = client.embed(texts)
 
-        # 검증: 올바른 payload 전송
+        # 검증: BYTES payload 전송
         call_args = mock_post.call_args
         payload = call_args.kwargs["json"]
         assert payload["inputs"][0]["name"] == "text"
@@ -73,6 +75,72 @@ def test_embedding_client():
         print(f"  응답 shape: {result.shape}")
         print(f"  dtype: {result.dtype}")
         print(f"  첫 벡터 norm: {np.linalg.norm(result[0]):.4f}")
+
+    print("  PASS\n")
+
+
+def test_embedding_client_tokenizer_mode():
+    """EmbeddingClient: 토크나이저 모드 — input_ids/attention_mask INT64 전송 검증"""
+    print("=" * 60)
+    print("[1b] EmbeddingClient — 토크나이저 모드")
+    print("=" * 60)
+
+    # Mock AutoTokenizer를 사용하여 transformers 의존 없이 테스트
+    mock_tokenizer = MagicMock()
+    mock_tokens = {
+        "input_ids": np.array([[1, 2, 3, 0], [1, 4, 5, 6]], dtype=np.int64),
+        "attention_mask": np.array([[1, 1, 1, 0], [1, 1, 1, 1]], dtype=np.int64),
+    }
+    mock_tokenizer.return_value = mock_tokens
+
+    client = EmbeddingClient("http://localhost:8080", "ruri_v3", tokenizer_name=None)
+    # 수동으로 tokenizer 설정 (mock)
+    client.tokenizer = mock_tokenizer
+
+    # Mock KServe V2 응답
+    mock_embeddings = np.random.randn(2, 768).tolist()
+    flat_data = [val for row in mock_embeddings for val in row]
+    mock_response = {
+        "outputs": [{
+            "name": "sentence_embedding",
+            "shape": [2, 768],
+            "datatype": "FP32",
+            "data": flat_data,
+        }]
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = mock_response
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch.object(client.session, "post", return_value=mock_resp) as mock_post:
+        texts = ["東京の天気", "大阪のグルメ"]
+        result = client.embed(texts)
+
+        # 검증: INT64 payload 전송 (input_ids + attention_mask)
+        call_args = mock_post.call_args
+        payload = call_args.kwargs["json"]
+        assert len(payload["inputs"]) == 2
+        assert payload["inputs"][0]["name"] == "input_ids"
+        assert payload["inputs"][0]["datatype"] == "INT64"
+        assert payload["inputs"][0]["shape"] == [2, 4]
+        assert payload["inputs"][1]["name"] == "attention_mask"
+        assert payload["inputs"][1]["datatype"] == "INT64"
+        assert payload["inputs"][1]["shape"] == [2, 4]
+        print(f"  input_ids: shape={payload['inputs'][0]['shape']}, datatype=INT64")
+        print(f"  attention_mask: shape={payload['inputs'][1]['shape']}, datatype=INT64")
+
+        # 검증: 올바른 shape 복원
+        assert result.shape == (2, 768)
+        print(f"  응답 shape: {result.shape}")
+
+    # V1 + tokenizer → ValueError
+    try:
+        EmbeddingClient("http://host", "m", protocol="v1", tokenizer_name="some-model")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "V2" in str(e)
+        print(f"  V1 + tokenizer → ValueError: OK")
 
     print("  PASS\n")
 
@@ -272,8 +340,8 @@ def test_embedding_client_v1_protocol():
     print("[5] EmbeddingClient — V1 Protocol")
     print("=" * 60)
 
-    # V1 클라이언트 생성
-    client = EmbeddingClient("http://localhost:8080", "my_model", protocol="v1")
+    # V1 클라이언트 생성 (V1은 텍스트 모드만 지원)
+    client = EmbeddingClient("http://localhost:8080", "my_model", protocol="v1", tokenizer_name=None)
     assert client.protocol == "v1"
     assert client.url == "http://localhost:8080/v1/models/my_model:predict"
     print(f"  URL: {client.url}  OK")
@@ -305,8 +373,8 @@ def test_embedding_client_v1_protocol():
         print(f"  응답 shape: {result.shape}  OK")
 
     # V2와 V1 비교 — 같은 base_url, 다른 프로토콜
-    v2 = EmbeddingClient("http://host:8080", "ruri_v3")
-    v1 = EmbeddingClient("http://host:8080", "ruri_v3", protocol="v1")
+    v2 = EmbeddingClient("http://host:8080", "ruri_v3", tokenizer_name=None)
+    v1 = EmbeddingClient("http://host:8080", "ruri_v3", protocol="v1", tokenizer_name=None)
     assert v2.url == "http://host:8080/v2/models/ruri_v3/infer"
     assert v1.url == "http://host:8080/v1/models/ruri_v3:predict"
     assert v2.protocol == "v2"
@@ -315,14 +383,14 @@ def test_embedding_client_v1_protocol():
     print(f"  V1 URL: {v1.url}")
 
     # trailing slash 처리 — http:// 이후에 // 없어야 함
-    v1_slash = EmbeddingClient("http://host:8080/", "m", protocol="v1")
+    v1_slash = EmbeddingClient("http://host:8080/", "m", protocol="v1", tokenizer_name=None)
     path_part = v1_slash.url.split("://", 1)[1]
     assert "//" not in path_part
     print(f"  trailing slash 정리: {v1_slash.url}  OK")
 
     # 잘못된 프로토콜
     try:
-        EmbeddingClient("http://host", "m", protocol="v3")
+        EmbeddingClient("http://host", "m", protocol="v3", tokenizer_name=None)
         assert False, "Should have raised ValueError"
     except ValueError as e:
         assert "v3" in str(e)
@@ -338,7 +406,7 @@ def test_embedding_client_v1_protocol():
         print(f"  embed_with_prefix + V1: OK")
 
     # timeout 커스텀
-    client_fast = EmbeddingClient("http://host:8080", "m", protocol="v2", timeout=30)
+    client_fast = EmbeddingClient("http://host:8080", "m", protocol="v2", timeout=30, tokenizer_name=None)
     assert client_fast.timeout == 30
     print(f"  custom timeout: {client_fast.timeout}s  OK")
 
@@ -351,7 +419,7 @@ def test_embedding_client_error_handling():
     print("[6] EmbeddingClient — 에러 핸들링")
     print("=" * 60)
 
-    client = EmbeddingClient("http://localhost:8080", "ruri_v3")
+    client = EmbeddingClient("http://localhost:8080", "ruri_v3", tokenizer_name=None)
 
     # HTTP 500 에러
     mock_resp = MagicMock()
@@ -378,7 +446,7 @@ def test_embedding_client_error_handling():
         print(f"  빈 입력 처리 (V2): shape={result.shape}  OK")
 
     # 빈 텍스트 리스트 (V1)
-    client_v1 = EmbeddingClient("http://localhost:8080", "m", protocol="v1")
+    client_v1 = EmbeddingClient("http://localhost:8080", "m", protocol="v1", tokenizer_name=None)
     mock_empty_v1 = MagicMock()
     mock_empty_v1.json.return_value = {"predictions": []}
     mock_empty_v1.raise_for_status = MagicMock()
@@ -392,7 +460,8 @@ def test_embedding_client_error_handling():
 
 
 if __name__ == "__main__":
-    test_embedding_client()
+    test_embedding_client_text_mode()
+    test_embedding_client_tokenizer_mode()
     test_parquet_reader()
     test_logging()
     test_retry()

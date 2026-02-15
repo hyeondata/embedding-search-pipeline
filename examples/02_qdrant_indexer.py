@@ -21,12 +21,12 @@ import numpy as np
 
 from qdrant_indexer import Config, QdrantIndexer, AsyncQdrantIndexer, Searcher, SearchResult
 from qdrant_indexer.pipeline import _process_batch
-from kserve_embed_client import (
+from kserve_embed_client import EmbeddingClient
+from pipeline_commons import (
     AsyncFailureLogger,
-    EmbeddingClient,
+    FailureLogger,
     PipelineStats,
     RetryConfig,
-    FailureLogger,
 )
 
 
@@ -38,8 +38,6 @@ def test_config():
 
     # 기본값
     c = Config()
-    assert c.kserve_url == "http://localhost:8080"
-    assert c.model_name == "ruri_v3"
     assert c.qdrant_url == "http://localhost:6333"
     assert c.collection_name == "keywords"
     assert c.vector_dim == 768
@@ -51,14 +49,13 @@ def test_config():
     assert c.bulk_mode is False
     assert c.bulk_indexing_threshold == 20000
     assert c.payload_key == "keyword"
-    print(f"  기본값: kserve={c.kserve_url}, qdrant={c.qdrant_url}, dim={c.vector_dim}")
+    print(f"  기본값: qdrant={c.qdrant_url}, dim={c.vector_dim}")
     print(f"  처리: batch={c.batch_size}, workers={c.workers}")
     print(f"  재시도: max={c.max_retries}, exponential={c.retry_exponential}")
     print(f"  벌크: bulk_mode={c.bulk_mode}, indexing_threshold={c.bulk_indexing_threshold}")
 
     # 커스텀
     c2 = Config(
-        kserve_url="http://gpu-server:8080",
         qdrant_url="http://qdrant-cluster:6333",
         collection_name="products",
         vector_dim=1024,
@@ -215,19 +212,17 @@ def test_qdrant_indexer():
 
 
 def test_searcher():
-    """Searcher: embed + Qdrant search 연동"""
+    """Searcher: embed_fn 주입 + Qdrant search 연동"""
     print("=" * 60)
-    print("[3] Searcher — embed → search 파이프라인")
+    print("[3] Searcher — embed_fn → search 파이프라인")
     print("=" * 60)
 
-    with patch("qdrant_indexer.searcher.EmbeddingClient") as MockEmbed, \
-         patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
+    with patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
 
-        mock_embedder = MockEmbed.return_value
         mock_indexer = MockQdrant.return_value
 
-        # Mock embed: (1, 768)
-        mock_embedder.embed.return_value = np.random.randn(1, 768)
+        # Mock embed_fn
+        mock_embed_fn = MagicMock(return_value=np.random.randn(1, 768))
 
         # Mock search result
         mock_points = []
@@ -246,11 +241,11 @@ def test_searcher():
         mock_response.points = mock_points
         mock_indexer.search.return_value = mock_response
 
-        searcher = Searcher(Config())
+        searcher = Searcher(Config(), embed_fn=mock_embed_fn, query_prefix="検索クエリ: ")
         results = searcher.search("東京 ラーメン", top_k=3)
 
         # 검증: prefix 추가
-        embed_call = mock_embedder.embed.call_args[0][0]
+        embed_call = mock_embed_fn.call_args[0][0]
         assert embed_call == ["検索クエリ: 東京 ラーメン"]
         print(f"  쿼리 prefix: '{embed_call[0]}'  OK")
 
@@ -265,7 +260,7 @@ def test_searcher():
         print(f"  결과 #{results[2].rank}: score={results[2].score:.2f} '{results[2].keyword}'")
 
         # search_batch
-        mock_embedder.embed.return_value = np.random.randn(2, 768)
+        mock_embed_fn.return_value = np.random.randn(2, 768)
         mock_batch = [mock_response, mock_response]
         mock_indexer.search_batch.return_value = mock_batch
 
@@ -275,14 +270,14 @@ def test_searcher():
         assert "大阪" in batch_results
 
         # prefix 확인
-        embed_call = mock_embedder.embed.call_args[0][0]
+        embed_call = mock_embed_fn.call_args[0][0]
         assert embed_call == ["検索クエリ: 東京", "検索クエリ: 大阪"]
         print(f"  search_batch: 2 queries → {len(batch_results)} results  OK")
 
         # custom prefix
-        mock_embedder.embed.return_value = np.random.randn(1, 768)
+        mock_embed_fn.return_value = np.random.randn(1, 768)
         searcher.search("テスト", prefix="検索文書: ")
-        embed_call = mock_embedder.embed.call_args[0][0]
+        embed_call = mock_embed_fn.call_args[0][0]
         assert embed_call == ["検索文書: テスト"]
         print(f"  custom prefix: '{embed_call[0]}'  OK")
 
@@ -291,12 +286,10 @@ def test_searcher():
         print(f"  SearchResult.payload: {results[0].payload}  OK")
 
     # custom payload_key
-    with patch("qdrant_indexer.searcher.EmbeddingClient") as MockEmbed, \
-         patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
+    with patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
 
-        mock_embedder = MockEmbed.return_value
         mock_indexer = MockQdrant.return_value
-        mock_embedder.embed.return_value = np.random.randn(1, 768)
+        mock_embed_fn = MagicMock(return_value=np.random.randn(1, 768))
 
         # payload에 "keyword" 없고 "product_name"만 있는 경우
         mock_point = MagicMock()
@@ -307,7 +300,11 @@ def test_searcher():
         mock_response.points = [mock_point]
         mock_indexer.search.return_value = mock_response
 
-        searcher2 = Searcher(Config(payload_key="product_name"), payload_key="product_name")
+        searcher2 = Searcher(
+            Config(payload_key="product_name"),
+            embed_fn=mock_embed_fn,
+            payload_key="product_name",
+        )
         results2 = searcher2.search("商品", top_k=1)
 
         assert results2[0].keyword == "商品X"  # payload_key로 추출
@@ -362,9 +359,8 @@ def test_async_process_batch():
     print("=" * 60)
 
     async def _run_tests():
-        # Mock embedder (sync — run_in_executor에서 실행됨)
-        mock_embedder = MagicMock(spec=EmbeddingClient)
-        mock_embedder.embed.return_value = np.random.randn(3, 768)
+        # Mock embed_fn (sync — run_in_executor에서 실행됨)
+        mock_embed_fn = MagicMock(return_value=np.random.randn(3, 768))
 
         # Mock async indexer
         mock_indexer = AsyncMock(spec=AsyncQdrantIndexer)
@@ -380,7 +376,7 @@ def test_async_process_batch():
             await _process_batch(
                 batch_id=0,
                 keywords=["a", "b", "c"],
-                embedder=mock_embedder,
+                embed_fn=mock_embed_fn,
                 indexer=mock_indexer,
                 semaphore=semaphore,
                 stats=stats,
@@ -388,7 +384,7 @@ def test_async_process_batch():
                 failure_logger=fl,
             )
 
-            mock_embedder.embed.assert_called_with(["a", "b", "c"])
+            mock_embed_fn.assert_called_with(["a", "b", "c"])
             mock_indexer.upsert_batch.assert_called_once()
             upsert_args = mock_indexer.upsert_batch.call_args
             assert upsert_args.kwargs["start_id"] == 0
@@ -406,7 +402,7 @@ def test_async_process_batch():
             await _process_batch(
                 batch_id=100,
                 keywords=["x", "y"],
-                embedder=mock_embedder,
+                embed_fn=mock_embed_fn,
                 indexer=mock_indexer,
                 semaphore=semaphore,
                 stats=stats,
@@ -425,7 +421,7 @@ def test_async_process_batch():
             await _process_batch(
                 batch_id=200,
                 keywords=["fail1", "fail2"],
-                embedder=mock_embedder,
+                embed_fn=mock_embed_fn,
                 indexer=mock_indexer,
                 semaphore=semaphore,
                 stats=stats,

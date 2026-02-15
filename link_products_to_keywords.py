@@ -43,14 +43,8 @@ from pathlib import Path
 from elasticsearch.helpers import async_bulk
 
 from es_indexer import Config as ESConfig, ESIndexer
-from kserve_embed_client import (
-    AsyncFailureLogger,
-    EmbeddingClient,
-    ParquetReader,
-    RURI_QUERY_PREFIX,
-    batch_iter,
-    timer,
-)
+from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
+from pipeline_commons import AsyncFailureLogger, ParquetReader, batch_iter, timer
 from qdrant_indexer import AsyncQdrantIndexer
 
 QUERY_PREFIX = RURI_QUERY_PREFIX

@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kserve_embed_client import BaseConfig
+from pipeline_commons import BaseConfig
 
 # ── 커스텀 스키마가 없을 때 사용되는 기본 스키마 ──
 DEFAULT_SCHEMA = {
@@ -24,10 +24,7 @@ DEFAULT_SCHEMA = {
 
 
 def build_default_schema(source_key: str = "keyword") -> dict:
-    """source_key에 맞는 기본 스키마를 동적으로 생성.
-
-    source_key="keyword"이면 DEFAULT_SCHEMA와 동일한 결과를 반환.
-    """
+    """source_key에 맞는 기본 스키마를 동적으로 생성."""
     return {
         "settings": {
             "number_of_shards": 1,

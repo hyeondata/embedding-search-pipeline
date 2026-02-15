@@ -7,7 +7,7 @@
   - logger.info() 한 번 호출로 양쪽에 동시 출력
 
 사용법:
-    from kserve_embed_client.log import setup_logging, get_logger
+    from pipeline_commons import setup_logging, get_logger
 
     logger = get_logger("qdrant_indexer", "pipeline")
     setup_logging("qdrant_indexer", log_file=Path("x.log"))
@@ -20,7 +20,7 @@ from pathlib import Path
 from rich.logging import RichHandler
 from rich.text import Text
 
-DEFAULT_PKG = "kserve_embed_client"
+DEFAULT_PKG = "pipeline"
 
 
 class _PlainFormatter(logging.Formatter):

@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "es-indexer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Elasticsearch bulk and realtime indexing pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
-    "kserve-embed-client>=0.1.0",
+    "pipeline-commons>=0.1.0",
     "elasticsearch>=8.0",
     "rich>=13.0",
 ]
@@ -23,4 +23,4 @@ dev = [
 ]
 
 [tool.uv.sources]
-kserve-embed-client = { workspace = true }
+pipeline-commons = { workspace = true }

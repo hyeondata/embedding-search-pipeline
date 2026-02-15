@@ -4,7 +4,7 @@
 Qdrant 유사 키워드 검색 (CLI)
 
 사전 조건:
-  1. KServe 서버:  python kserve_server.py --http_port 8080
+  1. KServe 서버:  Triton 또는 KServe 추론 서버 실행 중
   2. Qdrant:       docker compose up -d
 
 실행:
@@ -20,8 +20,6 @@ Qdrant 유사 키워드 검색 (CLI)
 
   # 대용량 배치 검색 (파일 입력 → JSONL 출력)
   python search_qdrant.py --file data/keywords_400k.txt --top_k 10
-  python search_qdrant.py --file data/keywords_400k.txt --top_k 5 --limit 1000 --workers 8 --batch_size 64
-  python search_qdrant.py --file data/keywords_400k.txt --output results.jsonl
 """
 
 import argparse
@@ -31,6 +29,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
+from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
 from qdrant_indexer import Config, Searcher, run_batch_search
 
 console = Console()
@@ -103,6 +102,10 @@ def main():
     parser.add_argument("--collection", default="keywords", help="Qdrant 컬렉션 이름")
     parser.add_argument("--interactive", "-i", action="store_true", help="대화형 검색 모드")
 
+    # KServe
+    parser.add_argument("--kserve_url", default="http://localhost:8000", help="KServe 서비스 URL")
+    parser.add_argument("--model_name", default="ruri_v3", help="모델 이름")
+
     # 배치 검색 옵션
     parser.add_argument("--file", "-f", type=Path, help="배치 검색: 쿼리 파일 경로 (줄바꿈 구분)")
     parser.add_argument("--output", "-o", type=Path, help="배치 검색: 결과 JSONL 파일 경로")
@@ -111,6 +114,9 @@ def main():
     parser.add_argument("--workers", type=int, default=8, help="배치 검색: 동시 워커 수 (기본: 8)")
 
     args = parser.parse_args()
+
+    # 임베딩 클라이언트 생성
+    client = EmbeddingClient(args.kserve_url, args.model_name)
 
     config = Config(
         collection_name=args.collection,
@@ -124,6 +130,8 @@ def main():
         run_batch_search(
             config=config,
             queries_path=args.file,
+            embed_fn=client.embed,
+            query_prefix=RURI_QUERY_PREFIX,
             output_path=args.output,
             top_k=args.top_k,
             limit=args.limit,
@@ -131,7 +139,7 @@ def main():
         return
 
     # 단건/대화형 검색
-    searcher = Searcher(config)
+    searcher = Searcher(config, embed_fn=client.embed, query_prefix=RURI_QUERY_PREFIX)
     count = searcher.indexer.count
     console.rule(f"[bold]Qdrant 검색  (컬렉션: {args.collection}, 벡터: {count:,}건)[/bold]")
 

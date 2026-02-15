@@ -31,7 +31,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from kserve_embed_client import (
+from pipeline_commons import (
     AsyncFailureLogger,
     PipelineStats,
     batch_iter,

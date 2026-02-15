@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from es_indexer import Config, DEFAULT_SCHEMA, ESIndexer, build_es_client
-from kserve_embed_client import AsyncFailureLogger, BaseConfig, load_keywords
+from pipeline_commons import AsyncFailureLogger, BaseConfig, load_keywords
 
 
 def test_config():

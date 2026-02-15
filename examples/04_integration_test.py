@@ -36,8 +36,11 @@ def test_cross_package_imports():
     print("=" * 60)
 
     # kserve-embed-client
-    from kserve_embed_client import (
-        EmbeddingClient,
+    from kserve_embed_client import EmbeddingClient
+    print("  kserve_embed_client: EmbeddingClient OK")
+
+    # pipeline-commons
+    from pipeline_commons import (
         ParquetReader,
         validate_parquet_columns,
         setup_logging,
@@ -46,7 +49,7 @@ def test_cross_package_imports():
         FailureLogger,
         with_retry,
     )
-    print("  kserve_embed_client: 8개 export OK")
+    print("  pipeline_commons: 7개 export OK")
 
     # qdrant-indexer
     from qdrant_indexer import (
@@ -71,15 +74,15 @@ def test_cross_package_imports():
     )
     print("  es_indexer: 6개 export OK")
 
-    # qdrant_indexer 내부에서 kserve_embed_client를 사용하는지 확인
+    # qdrant_indexer 내부에서 pipeline_commons를 사용하는지 확인
     from qdrant_indexer.pipeline import _process_batch
     from qdrant_indexer.searcher import Searcher as Searcher2
     assert Searcher is Searcher2
-    print("  qdrant_indexer.pipeline → kserve_embed_client import: OK")
+    print("  qdrant_indexer.pipeline → pipeline_commons import: OK")
 
-    # es_indexer가 kserve_embed_client의 공용 유틸리티를 사용하는지 확인
-    from kserve_embed_client import load_keywords, PipelineStats, AsyncFailureLogger
-    print("  es_indexer → kserve_embed_client 공용 유틸리티: OK")
+    # pipeline_commons 공용 유틸리티 확인
+    from pipeline_commons import load_keywords, PipelineStats, AsyncFailureLogger
+    print("  pipeline_commons 공용 유틸리티: OK")
 
     # 타입 확인
     assert issubclass(QdrantConfig, object)
@@ -100,12 +103,8 @@ def test_parquet_to_qdrant_pipeline():
     print("[2] Parquet → Qdrant 파이프라인 시뮬레이션")
     print("=" * 60)
 
-    from kserve_embed_client import (
-        AsyncFailureLogger,
-        EmbeddingClient,
-        ParquetReader,
-        PipelineStats,
-    )
+    from kserve_embed_client import EmbeddingClient
+    from pipeline_commons import AsyncFailureLogger, ParquetReader, PipelineStats
     from qdrant_indexer import AsyncQdrantIndexer, Config as QdrantCfg
     from qdrant_indexer.pipeline import _process_batch
 
@@ -151,9 +150,10 @@ def test_parquet_to_qdrant_pipeline():
             assert all_keywords[-1] == "佐賀 嬉野温泉"
             print(f"  전체 읽기: {len(all_keywords)}행 OK")
 
-            # Mock embedder (sync) + async indexer로 비동기 파이프라인 시뮬레이션
-            mock_embedder = MagicMock(spec=EmbeddingClient)
-            mock_embedder.embed.side_effect = lambda texts: np.random.randn(len(texts), 768)
+            # Mock embed_fn (sync) + async indexer로 비동기 파이프라인 시뮬레이션
+            mock_embed_fn = MagicMock(
+                side_effect=lambda texts: np.random.randn(len(texts), 768)
+            )
 
             mock_indexer = AsyncMock(spec=AsyncQdrantIndexer)
 
@@ -172,21 +172,21 @@ def test_parquet_to_qdrant_pipeline():
                     batch = chunk_kws[i:i + batch_size]
                     bid = chunk_id * 15 + i
                     coros.append(_process_batch(
-                        bid, batch, mock_embedder, mock_indexer,
+                        bid, batch, mock_embed_fn, mock_indexer,
                         semaphore, stats, config, fl,
                     ))
 
             await asyncio.gather(*coros)
 
             assert stats.processed == 50
-            assert mock_embedder.embed.call_count > 0
+            assert mock_embed_fn.call_count > 0
             assert mock_indexer.upsert_batch.call_count > 0
             print(f"  파이프라인 완료: processed={stats.processed}, "
-                  f"embed 호출={mock_embedder.embed.call_count}회, "
+                  f"embed 호출={mock_embed_fn.call_count}회, "
                   f"upsert 호출={mock_indexer.upsert_batch.call_count}회")
 
             # 각 embed 호출에서 올바른 키워드가 전달되었는지 확인
-            first_call_texts = mock_embedder.embed.call_args_list[0][0][0]
+            first_call_texts = mock_embed_fn.call_args_list[0][0][0]
             assert isinstance(first_call_texts, list)
             assert all(isinstance(t, str) for t in first_call_texts)
             print(f"  첫 embed 호출: {len(first_call_texts)}건 — '{first_call_texts[0]}'")
@@ -215,7 +215,7 @@ def test_parquet_to_es_pipeline():
     print("[3] Parquet → ES 파이프라인 시뮬레이션")
     print("=" * 60)
 
-    from kserve_embed_client import load_keywords
+    from pipeline_commons import load_keywords
     from es_indexer import Config
 
     with tempfile.TemporaryDirectory() as td:
@@ -277,11 +277,10 @@ def test_searcher_e2e():
 
     from qdrant_indexer import Config, Searcher, SearchResult
 
-    with patch("qdrant_indexer.searcher.EmbeddingClient") as MockEmbed, \
-         patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
+    with patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
 
-        mock_embedder = MockEmbed.return_value
         mock_indexer = MockQdrant.return_value
+        mock_embed_fn = MagicMock(return_value=np.random.randn(1, 768))
 
         # 현실적인 검색 결과 시뮬레이션
         search_scenarios = [
@@ -309,8 +308,8 @@ def test_searcher_e2e():
             query = scenario["query"]
             expected_results = scenario["results"]
 
-            # Mock embed: query → (1, 768)
-            mock_embedder.embed.return_value = np.random.randn(1, 768)
+            # Mock embed_fn: query → (1, 768)
+            mock_embed_fn.return_value = np.random.randn(1, 768)
 
             # Mock search results
             mock_points = []
@@ -326,7 +325,7 @@ def test_searcher_e2e():
             mock_indexer.search.return_value = mock_response
 
             # 검색 실행
-            searcher = Searcher(Config())
+            searcher = Searcher(Config(), embed_fn=mock_embed_fn, query_prefix="検索クエリ: ")
             results = searcher.search(query, top_k=len(expected_results))
 
             # 검증
@@ -334,7 +333,7 @@ def test_searcher_e2e():
             assert all(isinstance(r, SearchResult) for r in results)
 
             # prefix 검증
-            embed_call = mock_embedder.embed.call_args[0][0]
+            embed_call = mock_embed_fn.call_args[0][0]
             assert embed_call == [f"検索クエリ: {query}"]
 
             # rank 검증
@@ -349,7 +348,7 @@ def test_searcher_e2e():
 
         # search_batch 검증
         queries = ["東京 ラーメン", "大阪 グルメ", "京都 観光"]
-        mock_embedder.embed.return_value = np.random.randn(3, 768)
+        mock_embed_fn.return_value = np.random.randn(3, 768)
 
         batch_responses = []
         for q in queries:
@@ -369,7 +368,7 @@ def test_searcher_e2e():
             assert q in batch_results
             assert len(batch_results[q]) == 1
 
-        embed_call = mock_embedder.embed.call_args[0][0]
+        embed_call = mock_embed_fn.call_args[0][0]
         assert embed_call == ["検索クエリ: 東京 ラーメン", "検索クエリ: 大阪 グルメ", "検索クエリ: 京都 観光"]
         print(f"  search_batch: {len(queries)} queries → {len(batch_results)} results  OK")
 
@@ -385,7 +384,7 @@ def test_logger_independence():
     print("[5] 패키지별 로거 독립성")
     print("=" * 60)
 
-    from kserve_embed_client import get_logger, setup_logging
+    from pipeline_commons import get_logger, setup_logging
     import logging
 
     with tempfile.TemporaryDirectory() as td:
@@ -443,7 +442,7 @@ def test_retry_cross_package():
     print("[6] RetryConfig + FailureLogger 크로스 패키지 재사용")
     print("=" * 60)
 
-    from kserve_embed_client import RetryConfig, FailureLogger, with_retry
+    from pipeline_commons import RetryConfig, FailureLogger, with_retry
 
     with tempfile.TemporaryDirectory() as td:
         # qdrant 스타일 사용
@@ -495,7 +494,7 @@ def test_retry_cross_package():
         # 같은 클래스 사용 확인
         from qdrant_indexer.pipeline import _process_batch
         # _process_batch 내부에서 AsyncFailureLogger를 사용
-        # → kserve_embed_client.retry에서 import
+        # → pipeline_commons.retry에서 import
         assert qdrant_rc.__class__.__name__ == "RetryConfig"
         assert qdrant_fl.__class__.__name__ == "FailureLogger"
         print(f"  타입 일치: RetryConfig, FailureLogger  OK")
