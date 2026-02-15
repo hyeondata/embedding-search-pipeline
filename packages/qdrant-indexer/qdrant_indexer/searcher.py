@@ -6,7 +6,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from kserve_embed_client import EmbeddingClient, get_logger, setup_logging
+from kserve_embed_client import (
+    EmbeddingClient,
+    PipelineStats,
+    RURI_QUERY_PREFIX,
+    batch_iter,
+    get_logger,
+    setup_logging,
+    timer,
+)
 
 from .config import Config
 from .indexer import AsyncQdrantIndexer, QdrantIndexer
@@ -40,7 +48,7 @@ class Searcher:
             print(f"#{r.rank} score={r.score:.4f} {r.keyword}")
     """
 
-    QUERY_PREFIX = "検索クエリ: "
+    QUERY_PREFIX = RURI_QUERY_PREFIX
 
     def __init__(self, config: Config = None):
         config = config or Config()
@@ -116,74 +124,25 @@ class Searcher:
 # 대용량 배치 검색 파이프라인 (asyncio + query_batch_points)
 # ============================================================
 
-class _SearchStats:
-    """배치 검색 진행 통계"""
-
-    LOG_INTERVAL = 1000
-
-    def __init__(self, total: int):
-        self.total = total
-        self.searched = 0
-        self._start = time.perf_counter()
-        self._interval_start = time.perf_counter()
-        self._interval_count = 0
-
-    def update(self, count: int, embed_ms: float, search_ms: float):
-        self.searched += count
-        self._interval_count += count
-        n = self.searched
-
-        elapsed = time.perf_counter() - self._start
-        avg_qps = n / elapsed if elapsed > 0 else 0
-
-        should_log = (
-            n <= 100
-            or n % self.LOG_INTERVAL == 0
-            or n == self.total
-        )
-        if should_log:
-            now = time.perf_counter()
-            interval_sec = now - self._interval_start
-            interval_count = self._interval_count
-            self._interval_start = now
-            self._interval_count = 0
-            interval_qps = interval_count / interval_sec if interval_sec > 0 else 0
-            pct = n / self.total * 100
-
-            logger.info(
-                f"[bold]\\[{pct:5.1f}%][/bold] {n:>7,}/{self.total:,}  "
-                f"embed=[cyan]{embed_ms:.0f}ms[/cyan]  "
-                f"search=[cyan]{search_ms:.0f}ms[/cyan]  "
-                f"avg=[green]{avg_qps:.0f} q/s[/green]  "
-                f"interval=[green]{interval_qps:.0f} q/s[/green]"
-            )
-
-    @property
-    def wall_sec(self) -> float:
-        return time.perf_counter() - self._start
-
-
 async def _async_search_batch(
     queries: list[str],
     embedder: EmbeddingClient,
     async_indexer: AsyncQdrantIndexer,
     top_k: int,
     prefix: str,
-    stats: _SearchStats,
+    stats: PipelineStats,
     out_file,
     loop: asyncio.AbstractEventLoop,
 ):
     """단일 배치: 임베딩 → query_batch_points(1회) → JSONL 기록"""
     prefixed = [f"{prefix}{q}" for q in queries]
 
-    t0 = time.perf_counter()
-    embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
-    embed_ms = (time.perf_counter() - t0) * 1000
+    with timer() as t_embed:
+        embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
 
-    t0 = time.perf_counter()
-    vectors = [embeddings[i].tolist() for i in range(len(queries))]
-    responses = await async_indexer.search_batch(vectors, top_k=top_k)
-    search_ms = (time.perf_counter() - t0) * 1000
+    with timer() as t_search:
+        vectors = [embeddings[i].tolist() for i in range(len(queries))]
+        responses = await async_indexer.search_batch(vectors, top_k=top_k)
 
     lines = []
     for idx, query in enumerate(queries):
@@ -203,7 +162,7 @@ async def _async_search_batch(
 
     out_file.write("\n".join(lines) + "\n")
 
-    stats.update(len(queries), embed_ms, search_ms)
+    stats.update(len(queries), embed_ms=t_embed.ms, search_ms=t_search.ms)
 
 
 async def _run_async_batch_search(
@@ -211,7 +170,7 @@ async def _run_async_batch_search(
     queries: list[str],
     top_k: int,
     output_path: Path,
-    stats: _SearchStats,
+    stats: PipelineStats,
 ):
     """asyncio 이벤트 루프에서 배치 검색 실행"""
     embedder = EmbeddingClient(config.kserve_url, config.model_name)
@@ -220,10 +179,7 @@ async def _run_async_batch_search(
 
     sem = asyncio.Semaphore(config.workers)
 
-    batches = [
-        queries[i : i + config.batch_size]
-        for i in range(0, len(queries), config.batch_size)
-    ]
+    batches = [batch for _, batch in batch_iter(queries, config.batch_size)]
 
     with open(output_path, "w", encoding="utf-8") as out_file:
         async def bounded_search(batch):
@@ -288,7 +244,7 @@ def run_batch_search(
     logger.info(f"Qdrant 벡터: [cyan]{vec_count:,}[/cyan]건")
     logger.info("query_batch_points + AsyncQdrantClient")
 
-    stats = _SearchStats(total)
+    stats = PipelineStats(total, log_fn=logger.info, unit="q/s")
 
     asyncio.run(_run_async_batch_search(config, queries, top_k, output_path, stats))
 

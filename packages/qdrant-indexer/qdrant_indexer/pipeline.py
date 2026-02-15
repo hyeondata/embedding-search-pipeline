@@ -1,6 +1,5 @@
 """동시 인덱싱 파이프라인 (Parquet 지원 + 재시도 + 실패 로깅)"""
 
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -8,10 +7,15 @@ from pathlib import Path
 from kserve_embed_client import (
     EmbeddingClient,
     FailureLogger,
+    PipelineStats,
     ParquetReader,
+    RURI_QUERY_PREFIX,
     RetryConfig,
+    batch_iter,
     get_logger,
+    load_keywords,
     setup_logging,
+    timer,
     with_retry,
 )
 
@@ -20,65 +24,6 @@ from .indexer import QdrantIndexer
 
 _PKG = "qdrant_indexer"
 logger = get_logger(_PKG, "pipeline")
-
-
-# ============================================================
-# Thread-safe 통계
-# ============================================================
-class _Stats:
-    """인덱싱 진행 통계 + 구간별 RPS 측정 (thread-safe)"""
-
-    LOG_INTERVAL = 1000  # N건마다 로그 출력
-
-    def __init__(self, total: int):
-        self.total = total
-        self.indexed = 0
-        self.embed_ms = 0.0
-        self.upsert_ms = 0.0
-        self._lock = threading.Lock()
-        self._start = time.perf_counter()
-        # 구간별 RPS 측정
-        self._interval_start = time.perf_counter()
-        self._interval_count = 0
-
-    def update(self, count: int, embed_ms: float, upsert_ms: float):
-        with self._lock:
-            self.indexed += count
-            self.embed_ms += embed_ms
-            self.upsert_ms += upsert_ms
-            self._interval_count += count
-            n = self.indexed
-
-        elapsed = time.perf_counter() - self._start
-        avg_rps = n / elapsed if elapsed > 0 else 0
-
-        should_log = (
-            n <= 100
-            or n % self.LOG_INTERVAL == 0
-            or n == self.total
-        )
-        if should_log:
-            # 구간 RPS 계산
-            now = time.perf_counter()
-            with self._lock:
-                interval_sec = now - self._interval_start
-                interval_count = self._interval_count
-                self._interval_start = now
-                self._interval_count = 0
-            interval_rps = interval_count / interval_sec if interval_sec > 0 else 0
-            pct = n / self.total * 100
-
-            logger.info(
-                f"[bold]\\[{pct:5.1f}%][/bold] {n:>7,}/{self.total:,}  "
-                f"embed=[cyan]{embed_ms:.0f}ms[/cyan]  "
-                f"upsert=[cyan]{upsert_ms:.0f}ms[/cyan]  "
-                f"avg=[green]{avg_rps:.0f} t/s[/green]  "
-                f"interval=[green]{interval_rps:.0f} t/s[/green]"
-            )
-
-    @property
-    def wall_sec(self) -> float:
-        return time.perf_counter() - self._start
 
 
 # ============================================================
@@ -99,15 +44,13 @@ def _create_batch_processor(embedder, indexer, stats, failure_logger, retry_conf
     )
     def process_batch(batch_id: int, keywords: list[str]):
         """단일 배치: 임베딩 → Qdrant upsert (워커 스레드에서 실행)"""
-        t0 = time.perf_counter()
-        embeddings = embedder.embed(keywords)
-        embed_ms = (time.perf_counter() - t0) * 1000
+        with timer() as t_embed:
+            embeddings = embedder.embed(keywords)
 
-        t0 = time.perf_counter()
-        indexer.upsert_batch(start_id=batch_id, keywords=keywords, embeddings=embeddings)
-        upsert_ms = (time.perf_counter() - t0) * 1000
+        with timer() as t_upsert:
+            indexer.upsert_batch(start_id=batch_id, keywords=keywords, embeddings=embeddings)
 
-        stats.update(len(keywords), embed_ms, upsert_ms)
+        stats.update(len(keywords), embed_ms=t_embed.ms, upsert_ms=t_upsert.ms)
 
     return process_batch
 
@@ -155,11 +98,9 @@ def run_indexing(config: Config, log_path: Path = None):
         data_source = "parquet"
 
     else:
-        keywords = config.keywords_path.read_text(encoding="utf-8").strip().split("\n")
-        if config.limit > 0:
-            keywords = keywords[: config.limit]
+        keywords, source = load_keywords(config)
         total = len(keywords)
-        logger.info(f"[cyan]텍스트 파일: {config.keywords_path.name}[/cyan] ({total:,}건)")
+        logger.info(f"[cyan]{source}[/cyan] ({total:,}건)")
         data_source = "text"
 
     # 2. Qdrant 컬렉션 생성
@@ -190,7 +131,7 @@ def run_indexing(config: Config, log_path: Path = None):
         f"(workers=[cyan]{config.workers}[/cyan], batch=[cyan]{config.batch_size}[/cyan])"
     )
     embedder = EmbeddingClient(config.kserve_url, config.model_name)
-    stats = _Stats(total)
+    stats = PipelineStats(total, log_fn=logger.info)
 
     process_batch = _create_batch_processor(embedder, indexer, stats, failure_logger, retry_config)
 
@@ -199,9 +140,8 @@ def run_indexing(config: Config, log_path: Path = None):
             futures = []
 
             for chunk_id, chunk_keywords in reader.iter_chunks():
-                for i in range(0, len(chunk_keywords), config.batch_size):
-                    batch = chunk_keywords[i : i + config.batch_size]
-                    batch_id = chunk_id * config.parquet_chunk_size + i
+                for start, batch in batch_iter(chunk_keywords, config.batch_size):
+                    batch_id = chunk_id * config.parquet_chunk_size + start
                     futures.append(pool.submit(process_batch, batch_id, batch))
 
             for future in as_completed(futures):
@@ -211,15 +151,10 @@ def run_indexing(config: Config, log_path: Path = None):
                     logger.error(f"[bold red]배치 처리 실패 (최종)[/bold red]: {e}")
 
     else:
-        batches = [
-            (i, keywords[i : i + config.batch_size])
-            for i in range(0, total, config.batch_size)
-        ]
-
         with ThreadPoolExecutor(max_workers=config.workers) as pool:
             futures = [
-                pool.submit(process_batch, bid, batch)
-                for bid, batch in batches
+                pool.submit(process_batch, start, batch)
+                for start, batch in batch_iter(keywords, config.batch_size)
             ]
             for future in as_completed(futures):
                 try:
@@ -234,13 +169,13 @@ def run_indexing(config: Config, log_path: Path = None):
     logger.info(f"벡터 수: [cyan]{indexer.count:,}[/cyan]")
     logger.info(f"Wall time: [cyan]{wall:.1f}초[/cyan]")
     logger.info(f"처리량: [bold green]{total / wall:.0f} texts/sec[/bold green]")
-    logger.info(f"임베딩 합계: {stats.embed_ms / 1000:.1f}초 (스레드 CPU time)")
-    logger.info(f"upsert 합계: {stats.upsert_ms / 1000:.1f}초")
+    logger.info(f"임베딩 합계: {stats.get_timing('embed_ms') / 1000:.1f}초 (스레드 CPU time)")
+    logger.info(f"upsert 합계: {stats.get_timing('upsert_ms') / 1000:.1f}초")
 
     # 샘플 검색
     logger.info("[bold]--- 샘플 검색 ---[/bold]")
     query = "東京 ラーメン おすすめ"
-    query_emb = embedder.embed([f"検索クエリ: {query}"])
+    query_emb = embedder.embed([f"{RURI_QUERY_PREFIX}{query}"])
     results = indexer.search(query_emb[0].tolist(), top_k=5)
 
     logger.info(f"쿼리: {query}")

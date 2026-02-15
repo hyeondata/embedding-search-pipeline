@@ -3,10 +3,10 @@
 qdrant-indexer 패키지 예시 — Mock으로 전체 파이프라인 코드 경로 검증
 
 테스트 항목:
-  1. Config 기본값 + 커스텀 생성
+  1. Config 기본값 + 커스텀 생성 (BaseConfig 상속)
   2. QdrantIndexer — create_collection, upsert_batch, search, search_batch
   3. Searcher — search, search_batch (embed + Qdrant 연동)
-  4. pipeline._Stats 통계 로직
+  4. PipelineStats 통계 로직 (공용 유틸리티)
   5. pipeline._create_batch_processor 팩토리 패턴
 """
 
@@ -19,8 +19,8 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import numpy as np
 
 from qdrant_indexer import Config, QdrantIndexer, AsyncQdrantIndexer, Searcher, SearchResult
-from qdrant_indexer.pipeline import _Stats, _create_batch_processor
-from kserve_embed_client import EmbeddingClient, RetryConfig, FailureLogger
+from qdrant_indexer.pipeline import _create_batch_processor
+from kserve_embed_client import EmbeddingClient, PipelineStats, RetryConfig, FailureLogger
 
 
 def test_config():
@@ -219,31 +219,39 @@ def test_searcher():
 
 
 def test_pipeline_stats():
-    """pipeline._Stats: 스레드 안전 통계 + 로깅 조건"""
+    """PipelineStats: 스레드 안전 통계 + 로깅 조건 (공용 유틸리티)"""
     print("=" * 60)
-    print("[4] pipeline._Stats — 통계 + RPS 계산")
+    print("[4] PipelineStats — 통계 + RPS 계산")
     print("=" * 60)
 
-    stats = _Stats(total=1000)
-    assert stats.indexed == 0
+    stats = PipelineStats(total=1000)
+    assert stats.processed == 0
     assert stats.total == 1000
 
     # 업데이트 시뮬레이션
     stats.update(count=64, embed_ms=15.0, upsert_ms=8.0)
-    assert stats.indexed == 64
-    assert stats.embed_ms == 15.0
-    assert stats.upsert_ms == 8.0
-    print(f"  1차 업데이트: indexed={stats.indexed}, embed_ms={stats.embed_ms}")
+    assert stats.processed == 64
+    assert stats.get_timing("embed_ms") == 15.0
+    assert stats.get_timing("upsert_ms") == 8.0
+    print(f"  1차 업데이트: processed={stats.processed}, embed_ms={stats.get_timing('embed_ms')}")
 
     stats.update(count=36, embed_ms=12.0, upsert_ms=6.0)
-    assert stats.indexed == 100  # 100건 → should_log 트리거
-    assert stats.embed_ms == 27.0
-    print(f"  2차 업데이트: indexed={stats.indexed}, embed_ms={stats.embed_ms}")
+    assert stats.processed == 100  # 100건 → should_log 트리거
+    assert stats.get_timing("embed_ms") == 27.0
+    print(f"  2차 업데이트: processed={stats.processed}, embed_ms={stats.get_timing('embed_ms')}")
 
     # wall_sec
     time.sleep(0.05)
     assert stats.wall_sec > 0.05
     print(f"  wall_sec: {stats.wall_sec:.3f}s  OK")
+
+    # record_retry / record_failure
+    stats.record_retry()
+    assert stats.retries == 1
+    stats.record_failure(10)
+    assert stats.failed_count == 10
+    assert stats.failed_batches == 1
+    print(f"  retries={stats.retries}, failed={stats.failed_count}  OK")
 
     print("  PASS\n")
 
@@ -259,7 +267,7 @@ def test_batch_processor():
 
     mock_indexer = MagicMock()
 
-    stats = _Stats(total=100)
+    stats = PipelineStats(total=100)
 
     with tempfile.TemporaryDirectory() as td:
         fl = FailureLogger(Path(td) / "fail.jsonl", enabled=True)
@@ -274,8 +282,8 @@ def test_batch_processor():
         upsert_args = mock_indexer.upsert_batch.call_args
         assert upsert_args.kwargs["start_id"] == 0
         assert upsert_args.kwargs["keywords"] == ["a", "b", "c"]
-        assert stats.indexed == 3
-        print(f"  정상 배치: indexed={stats.indexed}, embed 호출 OK, upsert 호출 OK")
+        assert stats.processed == 3
+        print(f"  정상 배치: processed={stats.processed}, embed 호출 OK, upsert 호출 OK")
 
         # 실패 → 재시도 → 성공
         mock_indexer.reset_mock()

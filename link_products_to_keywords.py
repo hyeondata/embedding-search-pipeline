@@ -36,7 +36,6 @@ Product → KServe Embedding → Qdrant keyword search → Elasticsearch indexin
 
 import argparse
 import asyncio
-import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -45,11 +44,17 @@ from pathlib import Path
 from elasticsearch.helpers import async_bulk
 
 from es_indexer import Config as ESConfig, ESIndexer
-from kserve_embed_client import EmbeddingClient, ParquetReader
+from kserve_embed_client import (
+    AsyncFailureLogger,
+    EmbeddingClient,
+    ParquetReader,
+    RURI_QUERY_PREFIX,
+    batch_iter,
+    timer,
+)
 from qdrant_indexer import QdrantIndexer
 
-# ── ruri-v3 비대칭 검색 프리픽스 ──
-QUERY_PREFIX = "検索クエリ: "
+QUERY_PREFIX = RURI_QUERY_PREFIX
 
 logger = logging.getLogger("link_products")
 
@@ -83,39 +88,6 @@ PRODUCT_KEYWORDS_SCHEMA = {
         }
     },
 }
-
-
-# ============================================================
-# Dead Letter Writer — 최종 실패 배치를 JSONL로 기록
-# ============================================================
-class _DeadLetterWriter:
-    """실패 배치를 JSONL 파일에 비동기 안전하게 기록.
-
-    파일 형식 (1줄 = 1 실패 배치):
-        {"batch_id": 0, "count": 64, "error": "...", "ts": "...", "products": [...]}
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._lock = asyncio.Lock()
-        self._count = 0
-
-    async def write(self, batch_id: int, products: list[str], error: str):
-        record = {
-            "batch_id": batch_id,
-            "count": len(products),
-            "error": error,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "products": products,
-        }
-        async with self._lock:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._count += 1
-
-    @property
-    def count(self) -> int:
-        return self._count
 
 
 # ============================================================
@@ -184,11 +156,11 @@ async def _process_batch(
     stats: _Stats,
     max_retries: int,
     retry_delay: float,
-    dead_letter: _DeadLetterWriter,
+    failure_logger: AsyncFailureLogger,
 ):
     """
     1. embed(products) → 2. qdrant.search_batch() → 3. async_bulk to ES
-    실패 시 지수 백오프 재시도, 최종 실패 시 Dead Letter 기록.
+    실패 시 지수 백오프 재시도, 최종 실패 시 실패 로깅.
     """
     async with semaphore:
         loop = asyncio.get_event_loop()
@@ -204,9 +176,8 @@ async def _process_batch(
                     batch_results = qdrant.search_batch(vectors, top_k)
                     return [resp.points for resp in batch_results]
 
-                t0 = time.perf_counter()
-                all_matches = await loop.run_in_executor(executor, embed_and_search)
-                sync_ms = (time.perf_counter() - t0) * 1000
+                with timer() as t_sync:
+                    all_matches = await loop.run_in_executor(executor, embed_and_search)
 
                 # Step 3: ES bulk 인덱싱 (async)
                 actions = []
@@ -228,16 +199,15 @@ async def _process_batch(
                         "_source": doc,
                     })
 
-                t1 = time.perf_counter()
-                _success, errors = await async_bulk(
-                    es_indexer.es, actions, chunk_size=len(actions), raise_on_error=False
-                )
-                es_ms = (time.perf_counter() - t1) * 1000
+                with timer() as t_es:
+                    _success, errors = await async_bulk(
+                        es_indexer.es, actions, chunk_size=len(actions), raise_on_error=False
+                    )
 
                 if errors:
                     logger.warning(f"Batch {batch_idx}: {len(errors)} ES bulk errors")
 
-                stats.update(len(products), sync_ms, es_ms)
+                stats.update(len(products), t_sync.ms, t_es.ms)
                 return  # 성공
 
             except Exception as e:
@@ -253,13 +223,16 @@ async def _process_batch(
                 )
                 await asyncio.sleep(delay)
 
-        # 모든 재시도 소진 → Dead Letter에 기록
+        # 모든 재시도 소진 → 실패 로깅
         logger.error(
             f"Batch {batch_idx} 최종 실패 ({len(products)}건, "
             f"{max_retries + 1}회 시도): {last_error}"
         )
         stats.record_failure(len(products))
-        await dead_letter.write(batch_idx, products, str(last_error))
+        await failure_logger.log_failure(
+            batch_idx, last_error,
+            data_info={"count": len(products), "products": products},
+        )
 
 
 # ============================================================
@@ -353,25 +326,21 @@ async def _run(args):
     executor = ThreadPoolExecutor(max_workers=args.workers)
     semaphore = asyncio.Semaphore(args.workers)
 
-    # Dead Letter 경로 결정
+    # 실패 로그 경로 결정
     if args.dead_letter_path:
-        dl_path = args.dead_letter_path
-        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        fl_path = args.dead_letter_path
     else:
-        dl_path = log_file.with_suffix(".dead_letter.jsonl")
-    dead_letter = _DeadLetterWriter(dl_path)
+        fl_path = log_file.with_suffix(".failures.jsonl")
+    failure_logger = AsyncFailureLogger(fl_path, enabled=True)
 
-    batches = [
-        (i // args.batch_size, products[i : i + args.batch_size])
-        for i in range(0, total, args.batch_size)
-    ]
+    batches = list(batch_iter(products, args.batch_size))
     await asyncio.gather(*[
         _process_batch(
-            idx, batch, embedder, qdrant, es,
+            bid, batch, embedder, qdrant, es,
             args.top_k, executor, semaphore, stats,
-            args.max_retries, args.retry_delay, dead_letter,
+            args.max_retries, args.retry_delay, failure_logger,
         )
-        for idx, batch in batches
+        for bid, batch in batches
     ])
     wall = stats.wall_sec
 
@@ -392,7 +361,7 @@ async def _run(args):
         summary_lines.append(f"재시도 횟수: {stats.retries}회")
     if stats.failed_docs > 0:
         summary_lines.append(f"실패 문서: {stats.failed_docs:,}건 ({stats.failed_batches} 배치)")
-        summary_lines.append(f"Dead Letter: {dead_letter.path}")
+        summary_lines.append(f"실패 로그: {failure_logger.log_path}")
     for line in summary_lines:
         print(f"         {line}")
         logger.info(line)

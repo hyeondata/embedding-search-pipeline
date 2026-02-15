@@ -266,10 +266,89 @@ def test_retry():
     print("  PASS\n")
 
 
+def test_embedding_client_v1_protocol():
+    """EmbeddingClient: V1 프로토콜 (TFServing 호환) 지원"""
+    print("=" * 60)
+    print("[5] EmbeddingClient — V1 Protocol")
+    print("=" * 60)
+
+    # V1 클라이언트 생성
+    client = EmbeddingClient("http://localhost:8080", "my_model", protocol="v1")
+    assert client.protocol == "v1"
+    assert client.url == "http://localhost:8080/v1/models/my_model:predict"
+    print(f"  URL: {client.url}  OK")
+
+    # V1 응답 Mock: predictions는 이미 2D 배열
+    mock_embeddings = np.random.randn(3, 768).tolist()
+    mock_response = {"predictions": mock_embeddings}
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = mock_response
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch.object(client.session, "post", return_value=mock_resp) as mock_post:
+        texts = ["東京の天気", "大阪のグルメ", "京都の寺院"]
+        result = client.embed(texts)
+
+        # 검증: V1 payload 형식
+        call_args = mock_post.call_args
+        payload = call_args.kwargs["json"]
+        assert "instances" in payload
+        assert len(payload["instances"]) == 3
+        assert payload["instances"][0] == {"text": "東京の天気"}
+        assert payload["instances"][2] == {"text": "京都の寺院"}
+        print(f"  V1 payload: instances={len(payload['instances'])}건  OK")
+
+        # 검증: 올바른 shape
+        assert result.shape == (3, 768)
+        assert isinstance(result, np.ndarray)
+        print(f"  응답 shape: {result.shape}  OK")
+
+    # V2와 V1 비교 — 같은 base_url, 다른 프로토콜
+    v2 = EmbeddingClient("http://host:8080", "ruri_v3")
+    v1 = EmbeddingClient("http://host:8080", "ruri_v3", protocol="v1")
+    assert v2.url == "http://host:8080/v2/models/ruri_v3/infer"
+    assert v1.url == "http://host:8080/v1/models/ruri_v3:predict"
+    assert v2.protocol == "v2"
+    assert v1.protocol == "v1"
+    print(f"  V2 URL: {v2.url}")
+    print(f"  V1 URL: {v1.url}")
+
+    # trailing slash 처리 — http:// 이후에 // 없어야 함
+    v1_slash = EmbeddingClient("http://host:8080/", "m", protocol="v1")
+    path_part = v1_slash.url.split("://", 1)[1]
+    assert "//" not in path_part
+    print(f"  trailing slash 정리: {v1_slash.url}  OK")
+
+    # 잘못된 프로토콜
+    try:
+        EmbeddingClient("http://host", "m", protocol="v3")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "v3" in str(e)
+        print(f"  잘못된 프로토콜 거부: ValueError  OK")
+
+    # embed_with_prefix도 V1에서 동작
+    with patch.object(client.session, "post", return_value=mock_resp) as mock_post_v1:
+        result = client.embed_with_prefix(["テスト"], prefix="検索クエリ: ")
+
+        call_args = mock_post_v1.call_args
+        payload = call_args.kwargs["json"]
+        assert payload["instances"][0] == {"text": "検索クエリ: テスト"}
+        print(f"  embed_with_prefix + V1: OK")
+
+    # timeout 커스텀
+    client_fast = EmbeddingClient("http://host:8080", "m", protocol="v2", timeout=30)
+    assert client_fast.timeout == 30
+    print(f"  custom timeout: {client_fast.timeout}s  OK")
+
+    print("  PASS\n")
+
+
 def test_embedding_client_error_handling():
     """EmbeddingClient: HTTP 에러 처리"""
     print("=" * 60)
-    print("[5] EmbeddingClient — 에러 핸들링")
+    print("[6] EmbeddingClient — 에러 핸들링")
     print("=" * 60)
 
     client = EmbeddingClient("http://localhost:8080", "ruri_v3")
@@ -286,7 +365,7 @@ def test_embedding_client_error_handling():
             assert "500" in str(e)
             print(f"  HTTP 500 에러 전파: OK")
 
-    # 빈 텍스트 리스트
+    # 빈 텍스트 리스트 (V2)
     mock_empty_resp = MagicMock()
     mock_empty_resp.json.return_value = {
         "outputs": [{"name": "embedding", "shape": [0, 768], "data": []}]
@@ -296,7 +375,18 @@ def test_embedding_client_error_handling():
     with patch.object(client.session, "post", return_value=mock_empty_resp):
         result = client.embed([])
         assert result.shape == (0, 768)
-        print(f"  빈 입력 처리: shape={result.shape}  OK")
+        print(f"  빈 입력 처리 (V2): shape={result.shape}  OK")
+
+    # 빈 텍스트 리스트 (V1)
+    client_v1 = EmbeddingClient("http://localhost:8080", "m", protocol="v1")
+    mock_empty_v1 = MagicMock()
+    mock_empty_v1.json.return_value = {"predictions": []}
+    mock_empty_v1.raise_for_status = MagicMock()
+
+    with patch.object(client_v1.session, "post", return_value=mock_empty_v1):
+        result = client_v1.embed([])
+        assert result.shape == (0,)  # np.array([]) → (0,)
+        print(f"  빈 입력 처리 (V1): shape={result.shape}  OK")
 
     print("  PASS\n")
 
@@ -306,6 +396,7 @@ if __name__ == "__main__":
     test_parquet_reader()
     test_logging()
     test_retry()
+    test_embedding_client_v1_protocol()
     test_embedding_client_error_handling()
 
     print("=" * 60)

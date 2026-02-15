@@ -71,14 +71,14 @@ def test_cross_package_imports():
     print("  es_indexer: 6개 export OK")
 
     # qdrant_indexer 내부에서 kserve_embed_client를 사용하는지 확인
-    from qdrant_indexer.pipeline import _create_batch_processor, _Stats
+    from qdrant_indexer.pipeline import _create_batch_processor
     from qdrant_indexer.searcher import Searcher as Searcher2
     assert Searcher is Searcher2
     print("  qdrant_indexer.pipeline → kserve_embed_client import: OK")
 
-    # es_indexer 내부에서 kserve_embed_client를 사용하는지 확인
-    from es_indexer.pipeline import _load_keywords
-    print("  es_indexer.pipeline → kserve_embed_client import: OK")
+    # es_indexer가 kserve_embed_client의 공용 유틸리티를 사용하는지 확인
+    from kserve_embed_client import load_keywords, PipelineStats, AsyncFailureLogger
+    print("  es_indexer → kserve_embed_client 공용 유틸리티: OK")
 
     # 타입 확인
     assert issubclass(QdrantConfig, object)
@@ -100,9 +100,9 @@ def test_parquet_to_qdrant_pipeline():
     print("=" * 60)
 
     from kserve_embed_client import (
-        EmbeddingClient, ParquetReader, RetryConfig, FailureLogger,
+        EmbeddingClient, ParquetReader, PipelineStats, RetryConfig, FailureLogger,
     )
-    from qdrant_indexer.pipeline import _create_batch_processor, _Stats
+    from qdrant_indexer.pipeline import _create_batch_processor
 
     with tempfile.TemporaryDirectory() as td:
         # 실제 Parquet 파일 생성: 50개 일본어 키워드
@@ -151,7 +151,7 @@ def test_parquet_to_qdrant_pipeline():
 
         mock_indexer = MagicMock()
 
-        stats = _Stats(total=50)
+        stats = PipelineStats(total=50)
         fl = FailureLogger(Path(td) / "fail.jsonl", enabled=True)
         rc = RetryConfig(max_retries=2, initial_backoff=0.01)
 
@@ -169,11 +169,11 @@ def test_parquet_to_qdrant_pipeline():
                 process(batch_id, batch)
                 processed_count += len(batch)
 
-        assert stats.indexed == 50
+        assert stats.processed == 50
         assert processed_count == 50
         assert mock_embedder.embed.call_count > 0
         assert mock_indexer.upsert_batch.call_count > 0
-        print(f"  파이프라인 완료: indexed={stats.indexed}, "
+        print(f"  파이프라인 완료: processed={stats.processed}, "
               f"embed 호출={mock_embedder.embed.call_count}회, "
               f"upsert 호출={mock_indexer.upsert_batch.call_count}회")
 
@@ -200,12 +200,12 @@ def test_parquet_to_qdrant_pipeline():
 # 3. 실제 Parquet → es pipeline _load_keywords 시뮬레이션
 # ============================================================
 def test_parquet_to_es_pipeline():
-    """실제 Parquet → es_indexer._load_keywords 검증"""
+    """실제 Parquet → load_keywords (공용 유틸리티) 검증"""
     print("=" * 60)
     print("[3] Parquet → ES 파이프라인 시뮬레이션")
     print("=" * 60)
 
-    from es_indexer.pipeline import _load_keywords
+    from kserve_embed_client import load_keywords
     from es_indexer import Config
 
     with tempfile.TemporaryDirectory() as td:
@@ -217,7 +217,7 @@ def test_parquet_to_es_pipeline():
 
         # Parquet 소스로 전체 로드
         config = Config(parquet_path=parquet_path, parquet_chunk_size=30)
-        kws, source = _load_keywords(config)
+        kws, source = load_keywords(config)
         assert len(kws) == 100
         assert "Parquet" in source
         assert kws[0] == "商品_000"
@@ -226,7 +226,7 @@ def test_parquet_to_es_pipeline():
 
         # limit 적용
         config_limited = Config(parquet_path=parquet_path, limit=25)
-        kws_limited, _ = _load_keywords(config_limited)
+        kws_limited, _ = load_keywords(config_limited)
         assert len(kws_limited) == 25
         print(f"  Parquet limit=25: {len(kws_limited)}건  OK")
 
@@ -235,7 +235,7 @@ def test_parquet_to_es_pipeline():
         text_path.write_text("\n".join([f"キーワード_{i}" for i in range(30)]))
 
         config_text = Config(keywords_path=text_path)
-        kws_text, source_text = _load_keywords(config_text)
+        kws_text, source_text = load_keywords(config_text)
         assert len(kws_text) == 30
         assert "텍스트" in source_text
         print(f"  텍스트 파일: {len(kws_text)}건, source='{source_text}'  OK")
@@ -248,7 +248,7 @@ def test_parquet_to_es_pipeline():
             pq.write_table(sub, folder / f"part_{i:03d}.parquet")
 
         config_dir = Config(parquet_path=folder, parquet_chunk_size=25)
-        kws_dir, source_dir = _load_keywords(config_dir)
+        kws_dir, source_dir = load_keywords(config_dir)
         assert len(kws_dir) == 60
         assert "3 files" in source_dir
         print(f"  Parquet 폴더: {len(kws_dir)}건, source='{source_dir}'  OK")

@@ -1,4 +1,4 @@
-"""비동기 인덱싱 파이프라인 — Rich 로깅 + Progress Bar + 재시도 + Dead Letter
+"""비동기 인덱싱 파이프라인 — Rich 로깅 + Progress Bar + 재시도 + 실패 로깅
 
 콘솔: RichHandler (색상, 포맷)  +  Rich Progress (프로그레스 바)
 파일: FileHandler (plain text + timestamp)
@@ -9,11 +9,10 @@ Realtime 모드:
     인덱스 보존 → 배치 단위로 인덱싱 + 즉시 리프레시
 
 재시도: 배치 실패 시 지수 백오프로 max_retries 회 재시도
-Dead Letter: 최종 실패 배치를 JSONL 파일에 기록 (수동 재처리용)
+실패 로깅: 최종 실패 배치를 JSONL 파일에 기록 (수동 재처리용)
 """
 
 import asyncio
-import json
 import logging
 import time
 from pathlib import Path
@@ -32,14 +31,16 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from kserve_embed_client import (
+    AsyncFailureLogger,
+    PipelineStats,
+    batch_iter,
+    load_keywords,
+    timer,
+)
+
 from .config import Config
 from .indexer import ESIndexer
-
-# kserve-embed-client에서 ParquetReader 가져오기
-try:
-    from kserve_embed_client import ParquetReader
-except ImportError:
-    ParquetReader = None  # ParquetReader 없으면 텍스트 파일만 지원
 
 console = Console()
 logger = logging.getLogger("es_indexer")
@@ -83,60 +84,8 @@ def _setup_logger(config: Config, log_path: Path | None, prefix: str) -> Path:
 
 
 # ============================================================
-# 진행 통계 (Progress 연동)
+# Rich Progress bar
 # ============================================================
-class _Stats:
-    """Progress bar 업데이트 + 파일 로깅 + 재시도/실패 통계"""
-
-    LOG_INTERVAL = 5000
-
-    def __init__(self, total: int, progress: Progress, task_id):
-        self.total = total
-        self.indexed = 0
-        self.bulk_ms = 0.0
-        self.retries = 0
-        self.failed_docs = 0
-        self.failed_batches = 0
-        self._start = time.perf_counter()
-        self._progress = progress
-        self._task_id = task_id
-
-    def update(self, count: int, bulk_ms: float):
-        self.indexed += count
-        self.bulk_ms += bulk_ms
-        elapsed = time.perf_counter() - self._start
-        rps = self.indexed / elapsed if elapsed > 0 else 0
-
-        # Rich Progress bar 갱신
-        self._progress.update(
-            self._task_id,
-            advance=count,
-            throughput=f"{rps:,.0f} docs/s",
-            last_bulk=f"{bulk_ms:.0f}ms",
-        )
-
-        # 파일 로그 (주기적)
-        n = self.indexed
-        if n <= 500 or n % self.LOG_INTERVAL == 0 or n == self.total:
-            pct = n / self.total * 100
-            logger.info(
-                f"[{pct:5.1f}%] {n:>7,}/{self.total:,}  "
-                f"bulk={bulk_ms:.0f}ms  avg={rps:,.0f} t/s"
-            )
-
-    def record_retry(self):
-        self.retries += 1
-
-    def record_failure(self, doc_count: int):
-        self.failed_docs += doc_count
-        self.failed_batches += 1
-        self._progress.update(self._task_id, advance=doc_count)
-
-    @property
-    def wall_sec(self) -> float:
-        return time.perf_counter() - self._start
-
-
 def _create_progress() -> Progress:
     """파이프라인용 Rich Progress bar 생성"""
     return Progress(
@@ -155,33 +104,20 @@ def _create_progress() -> Progress:
     )
 
 
-# ============================================================
-# Dead Letter Writer
-# ============================================================
-class _DeadLetterWriter:
-    """실패 배치를 JSONL 파일에 비동기 안전하게 기록."""
+def _make_progress_callback(progress: Progress, task_id):
+    """PipelineStats.on_update 콜백 — Rich Progress bar 연동"""
 
-    def __init__(self, path: Path):
-        self.path = path
-        self._lock = asyncio.Lock()
-        self._count = 0
+    def callback(stats: PipelineStats, count: int, timing_ms: dict[str, float]):
+        rps = stats.avg_rps
+        bulk_ms = timing_ms.get("bulk_ms", 0)
+        progress.update(
+            task_id,
+            advance=count,
+            throughput=f"{rps:,.0f} docs/s",
+            last_bulk=f"{bulk_ms:.0f}ms",
+        )
 
-    async def write(self, batch_id: int, keywords: list[str], error: str):
-        record = {
-            "batch_id": batch_id,
-            "count": len(keywords),
-            "error": error,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "keywords": keywords,
-        }
-        async with self._lock:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._count += 1
-
-    @property
-    def count(self) -> int:
-        return self._count
+    return callback
 
 
 # ============================================================
@@ -192,42 +128,49 @@ async def _process_batch(
     keywords: list[str],
     indexer: ESIndexer,
     semaphore: asyncio.Semaphore,
-    stats: _Stats,
+    stats: PipelineStats,
     config: Config,
-    dead_letter: _DeadLetterWriter,
+    failure_logger: AsyncFailureLogger,
+    progress: Progress,
+    progress_task_id,
     refresh: bool = False,
 ):
-    """bulk_index + 재시도(지수 백오프) + 최종 실패 시 Dead Letter 기록."""
+    """bulk_index + 재시도(지수 백오프) + 최종 실패 시 실패 로깅."""
     async with semaphore:
         last_error: Exception | None = None
 
-        for attempt in range(1, config.max_retries + 2):
+        for attempt in range(1, config.max_retries + 1):
             try:
-                t0 = time.perf_counter()
-                await indexer.bulk_index(batch_id, keywords)
-                if refresh:
-                    await indexer.refresh()
-                stats.update(len(keywords), (time.perf_counter() - t0) * 1000)
+                with timer() as t:
+                    await indexer.bulk_index(batch_id, keywords)
+                    if refresh:
+                        await indexer.refresh()
+                stats.update(len(keywords), bulk_ms=t.ms)
                 return
             except Exception as e:
                 last_error = e
-                is_last = attempt > config.max_retries
-                if is_last:
+                if attempt >= config.max_retries:
                     break
-                delay = config.retry_delay * (2 ** (attempt - 1))
+                backoff = config.retry_backoff * (2 ** (attempt - 1))
+                if config.retry_exponential:
+                    backoff = min(backoff, config.retry_max_backoff)
                 stats.record_retry()
                 logger.warning(
-                    f"Batch {batch_id} 실패 (시도 {attempt}/{config.max_retries + 1}), "
-                    f"{delay:.1f}초 후 재시도: {e}"
+                    f"Batch {batch_id} 실패 (시도 {attempt}/{config.max_retries}), "
+                    f"{backoff:.1f}초 후 재시도: {e}"
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(backoff)
 
         logger.error(
             f"Batch {batch_id} 최종 실패 ({len(keywords)}건, "
-            f"{config.max_retries + 1}회 시도): {last_error}"
+            f"{config.max_retries}회 시도): {last_error}"
         )
         stats.record_failure(len(keywords))
-        await dead_letter.write(batch_id, keywords, str(last_error))
+        progress.update(progress_task_id, advance=len(keywords))
+        await failure_logger.log_failure(
+            batch_id, last_error,
+            data_info={"count": len(keywords), "keywords": keywords},
+        )
 
 
 def _summary_table(title: str, rows: list[tuple[str, str]]) -> Table:
@@ -240,67 +183,30 @@ def _summary_table(title: str, rows: list[tuple[str, str]]) -> Table:
     return table
 
 
-def _resolve_dead_letter_path(config: Config, log_file: Path) -> Path:
-    """Dead letter 파일 경로 결정."""
-    if config.dead_letter_path:
-        config.dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
-        return config.dead_letter_path
-    return log_file.with_suffix(".dead_letter.jsonl")
+def _resolve_failure_log_path(config: Config, log_file: Path) -> Path:
+    """실패 로그 파일 경로 결정."""
+    if config.failure_log_path:
+        return config.failure_log_path
+    return log_file.with_suffix(".failures.jsonl")
 
 
 def _build_summary_rows(
     count: int, total: int, wall: float,
-    stats: _Stats, dead_letter: _DeadLetterWriter,
+    stats: PipelineStats, failure_logger: AsyncFailureLogger,
 ) -> list[tuple[str, str]]:
     """요약 테이블 행 생성."""
     rows = [
         ("도큐먼트 수", f"{count:,}"),
         ("Wall time", f"{wall:.1f}초"),
         ("처리량", f"{total / wall:,.0f} docs/sec"),
-        ("bulk 합계", f"{stats.bulk_ms / 1000:.1f}초 (코루틴 time)"),
+        ("bulk 합계", f"{stats.get_timing('bulk_ms') / 1000:.1f}초 (코루틴 time)"),
     ]
     if stats.retries > 0:
         rows.append(("재시도 횟수", f"{stats.retries}회"))
-    if stats.failed_docs > 0:
-        rows.append(("실패 문서", f"[red]{stats.failed_docs:,}건 ({stats.failed_batches} 배치)[/]"))
-        rows.append(("Dead Letter", str(dead_letter.path)))
+    if stats.failed_count > 0:
+        rows.append(("실패 문서", f"[red]{stats.failed_count:,}건 ({stats.failed_batches} 배치)[/]"))
+        rows.append(("실패 로그", str(failure_logger.log_path)))
     return rows
-
-
-# ============================================================
-# 데이터 로드 헬퍼
-# ============================================================
-def _load_keywords(config: Config) -> tuple[list[str], str]:
-    """Config에 따라 Parquet 또는 텍스트 파일에서 키워드를 로드.
-
-    Returns:
-        (keywords, source_description)
-    """
-    if config.parquet_path:
-        if ParquetReader is None:
-            raise ImportError(
-                "Parquet 지원을 위해 kserve-embed-client 패키지가 필요합니다: "
-                "pip install kserve-embed-client"
-            )
-        reader = ParquetReader(
-            config.parquet_path,
-            chunk_size=config.parquet_chunk_size,
-            text_column=config.parquet_text_column,
-            limit=config.limit,
-        )
-        keywords = []
-        for _, chunk_keywords in reader.iter_chunks():
-            keywords.extend(chunk_keywords)
-        source = f"Parquet: {config.parquet_path.name}"
-        if config.parquet_path.is_dir():
-            source += f" ({len(reader.parquet_files)} files)"
-    else:
-        keywords = config.keywords_path.read_text(encoding="utf-8").strip().split("\n")
-        if config.limit > 0:
-            keywords = keywords[: config.limit]
-        source = f"텍스트 파일: {config.keywords_path.name}"
-
-    return keywords, source
 
 
 # ============================================================
@@ -312,7 +218,7 @@ async def _run_bulk(config: Config, log_path: Path | None = None):
 
     # [1/4] 키워드 로드
     logger.info("[1/4] 키워드 로드")
-    keywords, source = _load_keywords(config)
+    keywords, source = load_keywords(config)
     total = len(keywords)
     logger.info(f"{source} \u2192 {total:,}건 로드 완료")
 
@@ -329,24 +235,28 @@ async def _run_bulk(config: Config, log_path: Path | None = None):
         f"(workers={config.workers}, batch={config.batch_size}, "
         f"retries={config.max_retries})"
     )
-    batches = [
-        (i, keywords[i : i + config.batch_size])
-        for i in range(0, total, config.batch_size)
-    ]
+    batches = list(batch_iter(keywords, config.batch_size))
 
-    dl_path = _resolve_dead_letter_path(config, log_file)
-    dead_letter = _DeadLetterWriter(dl_path)
+    fl_path = _resolve_failure_log_path(config, log_file)
+    failure_logger = AsyncFailureLogger(fl_path, enabled=config.log_failures)
 
     progress = _create_progress()
     with progress:
         task_id = progress.add_task("Indexing", total=total, throughput="--", last_bulk="--")
-        stats = _Stats(total, progress, task_id)
+        stats = PipelineStats(
+            total,
+            on_update=_make_progress_callback(progress, task_id),
+            log_fn=logger.info,
+            log_interval=5000,
+            unit="docs/s",
+        )
         semaphore = asyncio.Semaphore(config.workers)
 
         await asyncio.gather(*[
             _process_batch(
                 bid, batch, indexer, semaphore, stats,
-                config, dead_letter, refresh=False,
+                config, failure_logger, progress, task_id,
+                refresh=False,
             )
             for bid, batch in batches
         ])
@@ -358,7 +268,7 @@ async def _run_bulk(config: Config, log_path: Path | None = None):
     await indexer.finalize()
 
     count = await indexer.count()
-    rows = _build_summary_rows(count, total, wall, stats, dead_letter)
+    rows = _build_summary_rows(count, total, wall, stats, failure_logger)
     console.print(_summary_table("결과 요약", rows))
 
     for label, value in rows:
@@ -377,7 +287,7 @@ async def _run_realtime(config: Config, log_path: Path | None = None):
 
     # [1/4] 키워드 로드
     logger.info("[1/4] 키워드 로드")
-    keywords, source = _load_keywords(config)
+    keywords, source = load_keywords(config)
     total = len(keywords)
     logger.info(f"{source} \u2192 {total:,}건 로드 완료")
 
@@ -398,24 +308,28 @@ async def _run_realtime(config: Config, log_path: Path | None = None):
         f"(workers={config.workers}, batch={config.batch_size}, "
         f"retries={config.max_retries})"
     )
-    batches = [
-        (i, keywords[i : i + config.batch_size])
-        for i in range(0, total, config.batch_size)
-    ]
+    batches = list(batch_iter(keywords, config.batch_size))
 
-    dl_path = _resolve_dead_letter_path(config, log_file)
-    dead_letter = _DeadLetterWriter(dl_path)
+    fl_path = _resolve_failure_log_path(config, log_file)
+    failure_logger = AsyncFailureLogger(fl_path, enabled=config.log_failures)
 
     progress = _create_progress()
     with progress:
         task_id = progress.add_task("Realtime", total=total, throughput="--", last_bulk="--")
-        stats = _Stats(total, progress, task_id)
+        stats = PipelineStats(
+            total,
+            on_update=_make_progress_callback(progress, task_id),
+            log_fn=logger.info,
+            log_interval=5000,
+            unit="docs/s",
+        )
         semaphore = asyncio.Semaphore(config.workers)
 
         await asyncio.gather(*[
             _process_batch(
                 bid, batch, indexer, semaphore, stats,
-                config, dead_letter, refresh=True,
+                config, failure_logger, progress, task_id,
+                refresh=True,
             )
             for bid, batch in batches
         ])
@@ -426,7 +340,7 @@ async def _run_realtime(config: Config, log_path: Path | None = None):
     count = await indexer.count()
     logger.info("[4/4] 검증")
 
-    rows = _build_summary_rows(count, total, wall, stats, dead_letter)
+    rows = _build_summary_rows(count, total, wall, stats, failure_logger)
     console.print(_summary_table("결과 요약", rows))
 
     for label, value in rows:

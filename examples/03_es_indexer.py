@@ -3,12 +3,13 @@
 es-indexer 패키지 예시 — Mock으로 전체 파이프라인 코드 경로 검증
 
 테스트 항목:
-  1. Config 기본값 + 클러스터 설정
+  1. Config 기본값 + 클러스터 설정 (BaseConfig 상속)
   2. build_es_client — 단일 노드 / 클러스터 / 인증
   3. ESIndexer — create_index, ensure_index, bulk_index, finalize, CRUD
   4. ESIndexer.from_config — classmethod 팩토리
-  5. pipeline._DeadLetterWriter — 비동기 실패 기록
-  6. pipeline._load_keywords — 텍스트/Parquet 데이터 로드
+  5. AsyncFailureLogger — 비동기 실패 기록 (공용 유틸리티)
+  6. load_keywords — 텍스트/Parquet 데이터 로드 (공용 유틸리티)
+  7. Config BaseConfig 상속 검증
 """
 
 import asyncio
@@ -18,13 +19,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from es_indexer import Config, DEFAULT_SCHEMA, ESIndexer, build_es_client
-from es_indexer.pipeline import _DeadLetterWriter, _load_keywords
+from kserve_embed_client import AsyncFailureLogger, BaseConfig, load_keywords
 
 
 def test_config():
-    """Config: 기본값 + 클러스터 설정"""
+    """Config: 기본값 + 클러스터 설정 + BaseConfig 상속"""
     print("=" * 60)
-    print("[1] Config — 기본값 + 클러스터")
+    print("[1] Config — 기본값 + 클러스터 + BaseConfig 상속")
     print("=" * 60)
 
     c = Config()
@@ -37,6 +38,17 @@ def test_config():
     assert c.es_fingerprint is None
     print(f"  기본: es_url={c.es_url}, index={c.index_name}")
     print(f"  처리: batch={c.batch_size}, workers={c.workers}")
+
+    # BaseConfig 상속 필드 확인
+    assert isinstance(c, BaseConfig)
+    assert hasattr(c, "retry_backoff")
+    assert hasattr(c, "retry_exponential")
+    assert hasattr(c, "retry_max_backoff")
+    assert hasattr(c, "log_failures")
+    assert c.retry_backoff == 1.0
+    assert c.retry_exponential is True
+    assert c.log_failures is True
+    print(f"  BaseConfig 상속: retry_backoff={c.retry_backoff}, exponential={c.retry_exponential}")
 
     # 클러스터 설정
     c2 = Config(
@@ -247,46 +259,56 @@ def test_from_config():
     print("  PASS\n")
 
 
-def test_dead_letter_writer():
-    """_DeadLetterWriter: 비동기 JSONL 기록"""
+def test_async_failure_logger():
+    """AsyncFailureLogger: 비동기 JSONL 실패 기록 (공용 유틸리티)"""
     print("=" * 60)
-    print("[6] _DeadLetterWriter — JSONL 기록")
+    print("[6] AsyncFailureLogger — JSONL 실패 기록")
     print("=" * 60)
 
     with tempfile.TemporaryDirectory() as td:
-        dl_path = Path(td) / "dead.jsonl"
-        writer = _DeadLetterWriter(dl_path)
-        assert writer.count == 0
+        fl_path = Path(td) / "failures.jsonl"
+        fl = AsyncFailureLogger(fl_path, enabled=True)
+        assert fl.count == 0
 
         async def write_entries():
-            await writer.write(100, ["kw1", "kw2"], "Connection refused")
-            await writer.write(200, ["kw3"], "Timeout")
+            await fl.log_failure(100, ConnectionError("Connection refused"),
+                                 data_info={"count": 2, "keywords": ["kw1", "kw2"]})
+            await fl.log_failure(200, TimeoutError("Timeout"),
+                                 data_info={"count": 1, "keywords": ["kw3"]})
 
         asyncio.run(write_entries())
 
-        assert writer.count == 2
-        lines = dl_path.read_text().strip().split("\n")
+        assert fl.count == 2
+        lines = fl_path.read_text().strip().split("\n")
         assert len(lines) == 2
 
         r1 = json.loads(lines[0])
         assert r1["batch_id"] == 100
+        assert r1["error_type"] == "ConnectionError"
+        assert "Connection refused" in r1["error_message"]
         assert r1["count"] == 2
-        assert r1["error"] == "Connection refused"
         assert r1["keywords"] == ["kw1", "kw2"]
-        print(f"  기록 1: batch_id={r1['batch_id']}, count={r1['count']}, error='{r1['error']}'")
+        print(f"  기록 1: batch_id={r1['batch_id']}, type={r1['error_type']}, count={r1['count']}")
 
         r2 = json.loads(lines[1])
         assert r2["batch_id"] == 200
-        print(f"  기록 2: batch_id={r2['batch_id']}, count={r2['count']}")
-        print(f"  총 기록: {writer.count}건  OK")
+        assert r2["error_type"] == "TimeoutError"
+        print(f"  기록 2: batch_id={r2['batch_id']}, type={r2['error_type']}")
+        print(f"  총 기록: {fl.count}건  OK")
+
+        # disabled 모드 확인
+        fl_disabled = AsyncFailureLogger(Path(td) / "none.jsonl", enabled=False)
+        asyncio.run(fl_disabled.log_failure(999, RuntimeError("ignored")))
+        assert fl_disabled.count == 0
+        print(f"  disabled 모드: count={fl_disabled.count}  OK")
 
     print("  PASS\n")
 
 
 def test_load_keywords():
-    """_load_keywords: 텍스트 파일 + Parquet 로드"""
+    """load_keywords: 텍스트 파일 + Parquet 로드 (공용 유틸리티)"""
     print("=" * 60)
-    print("[7] _load_keywords — 데이터 로드")
+    print("[7] load_keywords — 데이터 로드 (공용 유틸리티)")
     print("=" * 60)
 
     with tempfile.TemporaryDirectory() as td:
@@ -295,7 +317,7 @@ def test_load_keywords():
         txt_path.write_text("kw1\nkw2\nkw3\nkw4\nkw5", encoding="utf-8")
 
         config = Config(keywords_path=txt_path)
-        keywords, source = _load_keywords(config)
+        keywords, source = load_keywords(config)
         assert len(keywords) == 5
         assert keywords[0] == "kw1"
         assert "텍스트" in source
@@ -303,7 +325,7 @@ def test_load_keywords():
 
         # limit 적용
         config_limited = Config(keywords_path=txt_path, limit=3)
-        keywords_limited, _ = _load_keywords(config_limited)
+        keywords_limited, _ = load_keywords(config_limited)
         assert len(keywords_limited) == 3
         print(f"  텍스트 limit=3: {len(keywords_limited)}건  OK")
 
@@ -316,7 +338,7 @@ def test_load_keywords():
         pq.write_table(table, pq_path)
 
         config_pq = Config(parquet_path=pq_path, limit=20)
-        keywords_pq, source_pq = _load_keywords(config_pq)
+        keywords_pq, source_pq = load_keywords(config_pq)
         assert len(keywords_pq) == 20
         assert keywords_pq[0] == "pq_kw0"
         assert "Parquet" in source_pq
@@ -331,7 +353,7 @@ if __name__ == "__main__":
     test_build_es_client()
     test_es_indexer_crud()
     test_from_config()
-    test_dead_letter_writer()
+    test_async_failure_logger()
     test_load_keywords()
 
     print("=" * 60)

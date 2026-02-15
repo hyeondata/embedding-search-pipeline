@@ -27,10 +27,10 @@ from qdrant_client import AsyncQdrantClient, QdrantClient
 from qdrant_client.models import QueryRequest
 
 from es_indexer import ESIndexer
-from kserve_embed_client import EmbeddingClient
+from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
 from qdrant_indexer import QdrantIndexer
 
-QUERY_PREFIX = "検索クエリ: "
+QUERY_PREFIX = RURI_QUERY_PREFIX
 
 PRODUCT_KEYWORDS_SCHEMA = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
