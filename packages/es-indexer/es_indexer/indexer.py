@@ -151,6 +151,7 @@ class ESIndexer:
         *,
         ids: list[str] | None = None,
         documents: list[dict] | None = None,
+        source_key: str = "keyword",
     ):
         """키워드 리스트 → ES 도큐먼트로 벌크 저장.
 
@@ -158,7 +159,8 @@ class ESIndexer:
             start_id: 자동 증가 ID의 시작값 (ids 미지정 시 사용).
             keywords: 키워드 리스트 (documents 미지정 시 _source로 사용).
             ids: 커스텀 문서 ID 리스트. None이면 str(start_id + i) 자동 생성.
-            documents: 커스텀 _source 리스트. None이면 {"keyword": kw}로 생성.
+            documents: 커스텀 _source 리스트. None이면 {source_key: kw}로 생성.
+            source_key: 기본 _source의 필드 이름 (기본: "keyword").
         """
         n = len(documents) if documents is not None else len(keywords)
 
@@ -171,7 +173,7 @@ class ESIndexer:
             {
                 "_index": self.index_name,
                 "_id": ids[i] if ids is not None else str(start_id + i),
-                "_source": documents[i] if documents is not None else {"keyword": keywords[i]},
+                "_source": documents[i] if documents is not None else {source_key: keywords[i]},
             }
             for i in range(n)
         ]
@@ -212,17 +214,18 @@ class ESIndexer:
 
     async def index(
         self, doc_id: str, keyword: str, refresh: bool = True,
-        *, document: dict | None = None,
+        *, document: dict | None = None, source_key: str = "keyword",
     ):
         """단일 문서 인덱싱 (upsert).
 
         Args:
             doc_id: 문서 ID.
-            keyword: 키워드 (document 미지정 시 {"keyword": keyword}로 사용).
+            keyword: 키워드 (document 미지정 시 {source_key: keyword}로 사용).
             refresh: True면 즉시 리프레시.
-            document: 커스텀 _source 딕셔너리. None이면 {"keyword": keyword}.
+            document: 커스텀 _source 딕셔너리. None이면 {source_key: keyword}.
+            source_key: 기본 _source의 필드 이름 (기본: "keyword").
         """
-        doc = document if document is not None else {"keyword": keyword}
+        doc = document if document is not None else {source_key: keyword}
         await self.es.index(
             index=self.index_name,
             id=doc_id,

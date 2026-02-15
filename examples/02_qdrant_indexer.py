@@ -50,6 +50,7 @@ def test_config():
     assert c.log_failures is True
     assert c.bulk_mode is False
     assert c.bulk_indexing_threshold == 20000
+    assert c.payload_key == "keyword"
     print(f"  기본값: kserve={c.kserve_url}, qdrant={c.qdrant_url}, dim={c.vector_dim}")
     print(f"  처리: batch={c.batch_size}, workers={c.workers}")
     print(f"  재시도: max={c.max_retries}, exponential={c.retry_exponential}")
@@ -285,6 +286,34 @@ def test_searcher():
         assert embed_call == ["検索文書: テスト"]
         print(f"  custom prefix: '{embed_call[0]}'  OK")
 
+        # SearchResult.payload 필드 검증
+        assert results[0].payload == {"keyword": "東京 ラーメン 人気"}
+        print(f"  SearchResult.payload: {results[0].payload}  OK")
+
+    # custom payload_key
+    with patch("qdrant_indexer.searcher.EmbeddingClient") as MockEmbed, \
+         patch("qdrant_indexer.searcher.QdrantIndexer") as MockQdrant:
+
+        mock_embedder = MockEmbed.return_value
+        mock_indexer = MockQdrant.return_value
+        mock_embedder.embed.return_value = np.random.randn(1, 768)
+
+        # payload에 "keyword" 없고 "product_name"만 있는 경우
+        mock_point = MagicMock()
+        mock_point.score = 0.92
+        mock_point.payload = {"product_name": "商品X", "price": 5000}
+        mock_point.id = 42
+        mock_response = MagicMock()
+        mock_response.points = [mock_point]
+        mock_indexer.search.return_value = mock_response
+
+        searcher2 = Searcher(Config(payload_key="product_name"), payload_key="product_name")
+        results2 = searcher2.search("商品", top_k=1)
+
+        assert results2[0].keyword == "商品X"  # payload_key로 추출
+        assert results2[0].payload["price"] == 5000
+        print(f"  payload_key='product_name': keyword='{results2[0].keyword}', price={results2[0].payload['price']}  OK")
+
     print("  PASS\n")
 
 
@@ -494,6 +523,19 @@ def test_custom_payloads():
         except ValueError as e:
             assert "payloads" in str(e)
             print(f"  payloads 길이 불일치 → ValueError: OK")
+
+        # 커스텀 payload_key
+        mock_client.reset_mock()
+        indexer.upsert_batch(
+            start_id=0,
+            keywords=["商品A", "商品B"],
+            embeddings=np.random.randn(2, 768),
+            payload_key="product_name",
+        )
+        points = mock_client.upsert.call_args.kwargs["points"]
+        assert points[0].payload == {"product_name": "商品A"}
+        assert points[1].payload == {"product_name": "商品B"}
+        print(f"  payload_key='product_name': OK")
 
     print("  PASS\n")
 

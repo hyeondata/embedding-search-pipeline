@@ -221,7 +221,7 @@ async def _run_indexing(config: Config, log_path: Path = None):
 
     logger.info(f"쿼리: {query}")
     for r in results.points:
-        logger.info(f"  score=[green]{r.score:.4f}[/green]  {r.payload['keyword']}")
+        logger.info(f"  score=[green]{r.score:.4f}[/green]  {r.payload.get(config.payload_key, r.payload)}")
 
     await indexer.close()
     logger.info("[bold green]완료![/bold green]")
@@ -345,7 +345,7 @@ async def _run_realtime(config: Config, log_path: Path = None):
 
     logger.info(f"쿼리: {query}")
     for r in results.points:
-        logger.info(f"  score=[green]{r.score:.4f}[/green]  {r.payload['keyword']}")
+        logger.info(f"  score=[green]{r.score:.4f}[/green]  {r.payload.get(config.payload_key, r.payload)}")
 
     await indexer.close()
     logger.info("[bold green]완료![/bold green]")

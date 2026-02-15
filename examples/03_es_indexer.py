@@ -473,6 +473,26 @@ def test_custom_documents():
         assert call_kwargs["document"] == {"keyword": "テスト"}
         print(f"  index(기본): 하위호환 OK")
 
+        # bulk_index: 커스텀 source_key
+        with patch("es_indexer.indexer.async_bulk", new_callable=AsyncMock) as mock_bulk:
+            mock_bulk.return_value = (2, [])
+
+            asyncio.run(indexer.bulk_index(
+                0, ["商品A", "商品B"],
+                source_key="product_name",
+            ))
+
+            actions = mock_bulk.call_args[0][1]
+            assert actions[0]["_source"] == {"product_name": "商品A"}
+            assert actions[1]["_source"] == {"product_name": "商品B"}
+            print(f"  bulk_index(source_key='product_name'): OK")
+
+        # index: 커스텀 source_key
+        asyncio.run(indexer.index("1", "商品X", source_key="product_name"))
+        call_kwargs = mock_es.index.call_args.kwargs
+        assert call_kwargs["document"] == {"product_name": "商品X"}
+        print(f"  index(source_key='product_name'): OK")
+
     print("  PASS\n")
 
 

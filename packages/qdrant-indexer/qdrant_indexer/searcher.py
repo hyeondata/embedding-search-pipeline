@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from kserve_embed_client import (
@@ -25,12 +25,20 @@ logger = get_logger(_PKG, "searcher")
 
 @dataclass
 class SearchResult:
-    """검색 결과 1건"""
+    """검색 결과 1건.
+
+    Attributes:
+        rank: 순위 (1부터 시작).
+        score: 유사도 점수.
+        keyword: payload에서 payload_key로 추출한 텍스트 (하위호환).
+        point_id: Qdrant 포인트 ID.
+        payload: 전체 Qdrant payload 딕셔너리.
+    """
     rank: int
     score: float
     keyword: str
     point_id: int
-    payload: dict | None = None
+    payload: dict = field(default_factory=dict)
 
 
 class Searcher:
@@ -51,10 +59,11 @@ class Searcher:
 
     QUERY_PREFIX = RURI_QUERY_PREFIX
 
-    def __init__(self, config: Config = None):
+    def __init__(self, config: Config = None, *, payload_key: str = None):
         config = config or Config()
         self.embedder = EmbeddingClient(config.kserve_url, config.model_name)
         self.indexer = QdrantIndexer(config.qdrant_url, config.collection_name, config.vector_dim)
+        self.payload_key = payload_key or config.payload_key
 
     def search(self, query: str, top_k: int = 5, prefix: str = None) -> list[SearchResult]:
         """
@@ -79,7 +88,7 @@ class Searcher:
             SearchResult(
                 rank=i + 1,
                 score=point.score,
-                keyword=point.payload.get("keyword", ""),
+                keyword=point.payload.get(self.payload_key, ""),
                 point_id=point.id,
                 payload=point.payload,
             )
@@ -114,7 +123,7 @@ class Searcher:
                 SearchResult(
                     rank=i + 1,
                     score=point.score,
-                    keyword=point.payload.get("keyword", ""),
+                    keyword=point.payload.get(self.payload_key, ""),
                     point_id=point.id,
                     payload=point.payload,
                 )
@@ -133,6 +142,7 @@ async def _async_search_batch(
     async_indexer: AsyncQdrantIndexer,
     top_k: int,
     prefix: str,
+    payload_key: str,
     stats: PipelineStats,
     out_file,
     loop: asyncio.AbstractEventLoop,
@@ -155,7 +165,7 @@ async def _async_search_batch(
                 {
                     "rank": i + 1,
                     "score": round(point.score, 6),
-                    "keyword": point.payload.get("keyword", ""),
+                    payload_key: point.payload.get(payload_key, ""),
                     "point_id": point.id,
                     "payload": point.payload,
                 }
@@ -179,9 +189,10 @@ async def _run_async_batch_search(
     """asyncio 이벤트 루프에서 배치 검색 실행"""
     embedder = EmbeddingClient(config.kserve_url, config.model_name)
     async_indexer = AsyncQdrantIndexer(config.qdrant_url, config.collection_name, config.vector_dim)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     sem = asyncio.Semaphore(config.workers)
+    payload_key = config.payload_key
 
     batches = [batch for _, batch in batch_iter(queries, config.batch_size)]
 
@@ -190,7 +201,7 @@ async def _run_async_batch_search(
             async with sem:
                 await _async_search_batch(
                     batch, embedder, async_indexer, top_k,
-                    Searcher.QUERY_PREFIX, stats, out_file, loop,
+                    Searcher.QUERY_PREFIX, payload_key, stats, out_file, loop,
                 )
 
         await asyncio.gather(*[bounded_search(batch) for batch in batches])
@@ -262,6 +273,7 @@ def run_batch_search(
     logger.info(f"처리량: [bold green]{total / wall:.0f} queries/sec[/bold green]")
 
     # 샘플 출력
+    pk = config.payload_key
     logger.info("[bold]--- 샘플 결과 (처음 3건) ---[/bold]")
     with open(output_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
@@ -272,7 +284,7 @@ def run_batch_search(
             top1 = record["results"][0] if record["results"] else {}
             logger.info(
                 f'"{q}" → top1: [green][{top1.get("score", 0):.4f}][/green] '
-                f'{top1.get("keyword", "N/A")}'
+                f'{top1.get(pk, "N/A")}'
             )
 
     logger.info("[bold green]완료![/bold green]")

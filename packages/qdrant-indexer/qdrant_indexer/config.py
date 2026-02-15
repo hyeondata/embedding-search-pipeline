@@ -22,6 +22,9 @@ class Config(BaseConfig):
     collection_name: str = "keywords"
     vector_dim: int = 768
 
+    # payload 설정
+    payload_key: str = "keyword"  # payload에서 메인 텍스트 필드 이름
+
     # 벌크 최적화 설정 (bulk_mode=True 일 때만 적용)
     bulk_indexing_threshold: int = 20000  # finalize 시 복원할 indexing_threshold
 

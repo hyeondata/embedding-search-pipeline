@@ -127,6 +127,7 @@ class QdrantIndexer:
         *,
         ids: list[int | str] | None = None,
         payloads: list[dict] | None = None,
+        payload_key: str = "keyword",
     ):
         """키워드 + 임베딩 → Qdrant 포인트로 저장.
 
@@ -135,7 +136,8 @@ class QdrantIndexer:
             keywords: 키워드 리스트 (payloads 미지정 시 payload로 사용).
             embeddings: 임베딩 벡터 배열 (shape: [n, dim]).
             ids: 커스텀 포인트 ID 리스트. None이면 start_id 기반 자동 생성.
-            payloads: 커스텀 payload 리스트. None이면 {"keyword": kw}로 생성.
+            payloads: 커스텀 payload 리스트. None이면 {payload_key: kw}로 생성.
+            payload_key: 기본 payload의 필드 이름 (기본: "keyword").
         """
         n = len(embeddings)
 
@@ -152,7 +154,7 @@ class QdrantIndexer:
             PointStruct(
                 id=ids[i] if ids is not None else start_id + i,
                 vector=embeddings[i].tolist(),
-                payload=payloads[i] if payloads is not None else {"keyword": keywords[i]},
+                payload=payloads[i] if payloads is not None else {payload_key: keywords[i]},
             )
             for i in range(n)
         ]
@@ -287,6 +289,7 @@ class AsyncQdrantIndexer:
         *,
         ids: list[int | str] | None = None,
         payloads: list[dict] | None = None,
+        payload_key: str = "keyword",
     ):
         """키워드 + 임베딩 → Qdrant 포인트로 비동기 저장.
 
@@ -295,7 +298,8 @@ class AsyncQdrantIndexer:
             keywords: 키워드 리스트 (payloads 미지정 시 payload로 사용).
             embeddings: 임베딩 벡터 배열 (shape: [n, dim]).
             ids: 커스텀 포인트 ID 리스트. None이면 start_id 기반 자동 생성.
-            payloads: 커스텀 payload 리스트. None이면 {"keyword": kw}로 생성.
+            payloads: 커스텀 payload 리스트. None이면 {payload_key: kw}로 생성.
+            payload_key: 기본 payload의 필드 이름 (기본: "keyword").
         """
         n = len(embeddings)
 
@@ -312,7 +316,7 @@ class AsyncQdrantIndexer:
             PointStruct(
                 id=ids[i] if ids is not None else start_id + i,
                 vector=embeddings[i].tolist(),
-                payload=payloads[i] if payloads is not None else {"keyword": keywords[i]},
+                payload=payloads[i] if payloads is not None else {payload_key: keywords[i]},
             )
             for i in range(n)
         ]
