@@ -7,20 +7,27 @@ qdrant-indexer 패키지 예시 — Mock으로 전체 파이프라인 코드 경
   2. QdrantIndexer — create_collection, upsert_batch, search, search_batch
   3. Searcher — search, search_batch (embed + Qdrant 연동)
   4. PipelineStats 통계 로직 (공용 유틸리티)
-  5. pipeline._create_batch_processor 팩토리 패턴
+  5. _process_batch 비동기 배치 처리 (embed via executor + upsert async + 재시도)
 """
 
+import asyncio
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import numpy as np
 
 from qdrant_indexer import Config, QdrantIndexer, AsyncQdrantIndexer, Searcher, SearchResult
-from qdrant_indexer.pipeline import _create_batch_processor
-from kserve_embed_client import EmbeddingClient, PipelineStats, RetryConfig, FailureLogger
+from qdrant_indexer.pipeline import _process_batch
+from kserve_embed_client import (
+    AsyncFailureLogger,
+    EmbeddingClient,
+    PipelineStats,
+    RetryConfig,
+    FailureLogger,
+)
 
 
 def test_config():
@@ -96,6 +103,22 @@ def test_qdrant_indexer():
         indexer.create_collection()
         mock_client.delete_collection.assert_called_with("test_col")
         print(f"  기존 컬렉션 삭제 + 재생성: OK")
+
+        # ensure_collection (이미 존재 → False)
+        mock_client.reset_mock()
+        mock_collections.collections = [mock_existing]
+        result = indexer.ensure_collection()
+        assert result is False
+        mock_client.create_collection.assert_not_called()
+        print(f"  ensure_collection (존재): False, create 미호출  OK")
+
+        # ensure_collection (없음 → True + 신규 생성)
+        mock_client.reset_mock()
+        mock_collections.collections = []
+        result = indexer.ensure_collection()
+        assert result is True
+        mock_client.create_collection.assert_called_once()
+        print(f"  ensure_collection (신규): True, create 호출  OK")
 
         # upsert_batch
         keywords = ["東京", "大阪", "京都"]
@@ -303,62 +326,93 @@ def test_pipeline_stats():
     print("  PASS\n")
 
 
-def test_batch_processor():
-    """_create_batch_processor: 팩토리 패턴 + 재시도 통합"""
+def test_async_process_batch():
+    """_process_batch: 비동기 배치 처리 (embed via executor + upsert async + 재시도)"""
     print("=" * 60)
-    print("[5] _create_batch_processor — embed → upsert 배치 처리")
+    print("[5] _process_batch — 비동기 embed → upsert 배치 처리")
     print("=" * 60)
 
-    mock_embedder = MagicMock()
-    mock_embedder.embed.return_value = np.random.randn(3, 768)
+    async def _run_tests():
+        # Mock embedder (sync — run_in_executor에서 실행됨)
+        mock_embedder = MagicMock(spec=EmbeddingClient)
+        mock_embedder.embed.return_value = np.random.randn(3, 768)
 
-    mock_indexer = MagicMock()
+        # Mock async indexer
+        mock_indexer = AsyncMock(spec=AsyncQdrantIndexer)
 
-    stats = PipelineStats(total=100)
+        config = Config(max_retries=2, retry_backoff=0.01, retry_exponential=False)
+        stats = PipelineStats(total=100)
+        semaphore = asyncio.Semaphore(4)
 
-    with tempfile.TemporaryDirectory() as td:
-        fl = FailureLogger(Path(td) / "fail.jsonl", enabled=True)
-        rc = RetryConfig(max_retries=2, initial_backoff=0.01)
+        with tempfile.TemporaryDirectory() as td:
+            fl = AsyncFailureLogger(Path(td) / "fail.jsonl", enabled=True)
 
-        process = _create_batch_processor(mock_embedder, mock_indexer, stats, fl, rc)
+            # 1. 정상 배치 처리
+            await _process_batch(
+                batch_id=0,
+                keywords=["a", "b", "c"],
+                embedder=mock_embedder,
+                indexer=mock_indexer,
+                semaphore=semaphore,
+                stats=stats,
+                config=config,
+                failure_logger=fl,
+            )
 
-        # 정상 배치 처리 (positional args — ThreadPoolExecutor와 동일)
-        process(0, ["a", "b", "c"])
-        mock_embedder.embed.assert_called_with(["a", "b", "c"])
-        mock_indexer.upsert_batch.assert_called_once()
-        upsert_args = mock_indexer.upsert_batch.call_args
-        assert upsert_args.kwargs["start_id"] == 0
-        assert upsert_args.kwargs["keywords"] == ["a", "b", "c"]
-        assert stats.processed == 3
-        print(f"  정상 배치: processed={stats.processed}, embed 호출 OK, upsert 호출 OK")
+            mock_embedder.embed.assert_called_with(["a", "b", "c"])
+            mock_indexer.upsert_batch.assert_called_once()
+            upsert_args = mock_indexer.upsert_batch.call_args
+            assert upsert_args.kwargs["start_id"] == 0
+            assert upsert_args.kwargs["keywords"] == ["a", "b", "c"]
+            assert stats.processed == 3
+            print(f"  정상 배치: processed={stats.processed}, embed 호출 OK, upsert 호출 OK")
 
-        # 실패 → 재시도 → 성공
-        mock_indexer.reset_mock()
-        mock_indexer.upsert_batch.side_effect = [
-            ConnectionError("timeout"),
-            None,  # 2번째 성공
-        ]
+            # 2. 실패 → 재시도 → 성공
+            mock_indexer.reset_mock()
+            mock_indexer.upsert_batch.side_effect = [
+                ConnectionError("timeout"),
+                None,  # 2번째 성공
+            ]
 
-        process2 = _create_batch_processor(mock_embedder, mock_indexer, stats, fl, rc)
-        process2(100, ["x", "y"])
-        assert mock_indexer.upsert_batch.call_count == 2
-        print(f"  재시도 후 성공: upsert 호출 {mock_indexer.upsert_batch.call_count}회  OK")
+            await _process_batch(
+                batch_id=100,
+                keywords=["x", "y"],
+                embedder=mock_embedder,
+                indexer=mock_indexer,
+                semaphore=semaphore,
+                stats=stats,
+                config=config,
+                failure_logger=fl,
+            )
 
-        # 모든 재시도 실패
-        mock_indexer.reset_mock()
-        mock_indexer.upsert_batch.side_effect = RuntimeError("DB crashed")
+            assert mock_indexer.upsert_batch.call_count == 2
+            assert stats.retries == 1
+            print(f"  재시도 후 성공: upsert 호출 {mock_indexer.upsert_batch.call_count}회, retries={stats.retries}  OK")
 
-        process3 = _create_batch_processor(mock_embedder, mock_indexer, stats, fl, rc)
-        try:
-            process3(200, ["fail1", "fail2"])
-            assert False, "Should have raised"
-        except RuntimeError:
-            pass
+            # 3. 모든 재시도 실패 → failure_logger에 기록
+            mock_indexer.reset_mock()
+            mock_indexer.upsert_batch.side_effect = RuntimeError("DB crashed")
 
-        fail_log = (Path(td) / "fail.jsonl").read_text().strip().split("\n")
-        assert len(fail_log) >= 2
-        print(f"  최종 실패: FailureLogger에 {len(fail_log)}건 기록  OK")
+            await _process_batch(
+                batch_id=200,
+                keywords=["fail1", "fail2"],
+                embedder=mock_embedder,
+                indexer=mock_indexer,
+                semaphore=semaphore,
+                stats=stats,
+                config=config,
+                failure_logger=fl,
+            )
 
+            # _process_batch는 예외를 던지지 않고 failure_logger에 기록
+            assert stats.failed_count == 2
+            assert stats.failed_batches == 1
+            fail_log = (Path(td) / "fail.jsonl").read_text().strip().split("\n")
+            assert len(fail_log) == 1  # 최종 실패 1건
+            assert "DB crashed" in fail_log[0]
+            print(f"  최종 실패: AsyncFailureLogger에 {len(fail_log)}건, failed_count={stats.failed_count}  OK")
+
+    asyncio.run(_run_tests())
     print("  PASS\n")
 
 
@@ -367,7 +421,7 @@ if __name__ == "__main__":
     test_qdrant_indexer()
     test_searcher()
     test_pipeline_stats()
-    test_batch_processor()
+    test_async_process_batch()
 
     print("=" * 60)
     print("ALL qdrant-indexer EXAMPLES PASSED")

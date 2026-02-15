@@ -14,6 +14,7 @@
   6. RetryConfig + FailureLogger 크로스 패키지 재사용
 """
 
+import asyncio
 import json
 import tempfile
 import time
@@ -71,7 +72,7 @@ def test_cross_package_imports():
     print("  es_indexer: 6개 export OK")
 
     # qdrant_indexer 내부에서 kserve_embed_client를 사용하는지 확인
-    from qdrant_indexer.pipeline import _create_batch_processor
+    from qdrant_indexer.pipeline import _process_batch
     from qdrant_indexer.searcher import Searcher as Searcher2
     assert Searcher is Searcher2
     print("  qdrant_indexer.pipeline → kserve_embed_client import: OK")
@@ -100,98 +101,107 @@ def test_parquet_to_qdrant_pipeline():
     print("=" * 60)
 
     from kserve_embed_client import (
-        EmbeddingClient, ParquetReader, PipelineStats, RetryConfig, FailureLogger,
+        AsyncFailureLogger,
+        EmbeddingClient,
+        ParquetReader,
+        PipelineStats,
     )
-    from qdrant_indexer.pipeline import _create_batch_processor
+    from qdrant_indexer import AsyncQdrantIndexer, Config as QdrantCfg
+    from qdrant_indexer.pipeline import _process_batch
 
-    with tempfile.TemporaryDirectory() as td:
-        # 실제 Parquet 파일 생성: 50개 일본어 키워드
-        keywords = [
-            "東京 ラーメン", "大阪 たこ焼き", "京都 抹茶", "北海道 海鮮",
-            "福岡 もつ鍋", "名古屋 味噌カツ", "広島 お好み焼き", "仙台 牛タン",
-            "札幌 スープカレー", "横浜 中華街", "神戸 ビーフ", "沖縄 ソーキそば",
-            "金沢 寿司", "長崎 ちゃんぽん", "鹿児島 黒豚", "新潟 日本酒",
-            "静岡 うなぎ", "愛媛 みかん", "熊本 馬刺し", "山形 芋煮",
-            "秋田 きりたんぽ", "岩手 わんこそば", "青森 りんご", "石川 加賀料理",
-            "富山 ブラックラーメン", "岐阜 鶏ちゃん", "三重 松阪牛", "滋賀 近江牛",
-            "奈良 柿の葉寿司", "和歌山 梅干し", "鳥取 カニ", "島根 出雲そば",
-            "岡山 きびだんご", "山口 ふぐ", "香川 讃岐うどん", "徳島 阿波尾鶏",
-            "高知 カツオ", "佐賀 シシリアンライス", "大分 とり天", "宮崎 チキン南蛮",
-            "栃木 餃子", "群馬 焼きまんじゅう", "埼玉 十万石饅頭", "千葉 落花生",
-            "茨城 納豆", "長野 信州そば", "山梨 ほうとう", "福島 喜多方ラーメン",
-            "徳島 鯛めし", "佐賀 嬉野温泉",
-        ]
+    async def _run_pipeline_test():
+        with tempfile.TemporaryDirectory() as td:
+            # 실제 Parquet 파일 생성: 50개 일본어 키워드
+            keywords = [
+                "東京 ラーメン", "大阪 たこ焼き", "京都 抹茶", "北海道 海鮮",
+                "福岡 もつ鍋", "名古屋 味噌カツ", "広島 お好み焼き", "仙台 牛タン",
+                "札幌 スープカレー", "横浜 中華街", "神戸 ビーフ", "沖縄 ソーキそば",
+                "金沢 寿司", "長崎 ちゃんぽん", "鹿児島 黒豚", "新潟 日本酒",
+                "静岡 うなぎ", "愛媛 みかん", "熊本 馬刺し", "山形 芋煮",
+                "秋田 きりたんぽ", "岩手 わんこそば", "青森 りんご", "石川 加賀料理",
+                "富山 ブラックラーメン", "岐阜 鶏ちゃん", "三重 松阪牛", "滋賀 近江牛",
+                "奈良 柿の葉寿司", "和歌山 梅干し", "鳥取 カニ", "島根 出雲そば",
+                "岡山 きびだんご", "山口 ふぐ", "香川 讃岐うどん", "徳島 阿波尾鶏",
+                "高知 カツオ", "佐賀 シシリアンライス", "大分 とり天", "宮崎 チキン南蛮",
+                "栃木 餃子", "群馬 焼きまんじゅう", "埼玉 十万石饅頭", "千葉 落花生",
+                "茨城 納豆", "長野 信州そば", "山梨 ほうとう", "福島 喜多方ラーメン",
+                "徳島 鯛めし", "佐賀 嬉野温泉",
+            ]
 
-        table = pa.table({
-            "keyword": keywords,
-            "category": [f"food_{i % 5}" for i in range(len(keywords))],
-            "score": [round(0.5 + i * 0.01, 2) for i in range(len(keywords))],
-        })
-        parquet_path = Path(td) / "keywords.parquet"
-        pq.write_table(table, parquet_path)
-        print(f"  Parquet 생성: {len(keywords)}행, 3컬럼 (keyword, category, score)")
+            table = pa.table({
+                "keyword": keywords,
+                "category": [f"food_{i % 5}" for i in range(len(keywords))],
+                "score": [round(0.5 + i * 0.01, 2) for i in range(len(keywords))],
+            })
+            parquet_path = Path(td) / "keywords.parquet"
+            pq.write_table(table, parquet_path)
+            print(f"  Parquet 생성: {len(keywords)}행, 3컬럼 (keyword, category, score)")
 
-        # ParquetReader로 청크 읽기
-        reader = ParquetReader(parquet_path, chunk_size=15, text_column="keyword")
-        assert reader.total_rows == 50
-        assert reader.num_chunks == 4  # ceil(50/15)
-        print(f"  ParquetReader: {reader.total_rows}행, {reader.num_chunks}청크")
+            # ParquetReader로 청크 읽기
+            reader = ParquetReader(parquet_path, chunk_size=15, text_column="keyword")
+            assert reader.total_rows == 50
+            assert reader.num_chunks == 4  # ceil(50/15)
+            print(f"  ParquetReader: {reader.total_rows}행, {reader.num_chunks}청크")
 
-        all_keywords = []
-        for batch_id, kws in reader.iter_chunks():
-            all_keywords.extend(kws)
-        assert len(all_keywords) == 50
-        assert all_keywords[0] == "東京 ラーメン"
-        assert all_keywords[-1] == "佐賀 嬉野温泉"
-        print(f"  전체 읽기: {len(all_keywords)}행 OK")
+            all_keywords = []
+            for batch_id, kws in reader.iter_chunks():
+                all_keywords.extend(kws)
+            assert len(all_keywords) == 50
+            assert all_keywords[0] == "東京 ラーメン"
+            assert all_keywords[-1] == "佐賀 嬉野温泉"
+            print(f"  전체 읽기: {len(all_keywords)}행 OK")
 
-        # Mock embedder + indexer로 파이프라인 시뮬레이션
-        mock_embedder = MagicMock(spec=EmbeddingClient)
-        mock_embedder.embed.side_effect = lambda texts: np.random.randn(len(texts), 768)
+            # Mock embedder (sync) + async indexer로 비동기 파이프라인 시뮬레이션
+            mock_embedder = MagicMock(spec=EmbeddingClient)
+            mock_embedder.embed.side_effect = lambda texts: np.random.randn(len(texts), 768)
 
-        mock_indexer = MagicMock()
+            mock_indexer = AsyncMock(spec=AsyncQdrantIndexer)
 
-        stats = PipelineStats(total=50)
-        fl = FailureLogger(Path(td) / "fail.jsonl", enabled=True)
-        rc = RetryConfig(max_retries=2, initial_backoff=0.01)
+            config = QdrantCfg(max_retries=2, retry_backoff=0.01, retry_exponential=False)
+            stats = PipelineStats(total=50)
+            fl = AsyncFailureLogger(Path(td) / "fail.jsonl", enabled=True)
+            semaphore = asyncio.Semaphore(4)
 
-        process = _create_batch_processor(mock_embedder, mock_indexer, stats, fl, rc)
+            # 청크 단위로 비동기 처리 시뮬레이션
+            reader2 = ParquetReader(parquet_path, chunk_size=15, text_column="keyword")
+            batch_size = 10
+            coros = []
 
-        # 청크 단위로 처리 시뮬레이션
-        reader2 = ParquetReader(parquet_path, chunk_size=15, text_column="keyword")
-        batch_size = 10
-        processed_count = 0
+            for chunk_id, chunk_kws in reader2.iter_chunks():
+                for i in range(0, len(chunk_kws), batch_size):
+                    batch = chunk_kws[i:i + batch_size]
+                    bid = chunk_id * 15 + i
+                    coros.append(_process_batch(
+                        bid, batch, mock_embedder, mock_indexer,
+                        semaphore, stats, config, fl,
+                    ))
 
-        for chunk_id, chunk_kws in reader2.iter_chunks():
-            for i in range(0, len(chunk_kws), batch_size):
-                batch = chunk_kws[i:i + batch_size]
-                batch_id = chunk_id * 15 + i
-                process(batch_id, batch)
-                processed_count += len(batch)
+            await asyncio.gather(*coros)
 
-        assert stats.processed == 50
-        assert processed_count == 50
-        assert mock_embedder.embed.call_count > 0
-        assert mock_indexer.upsert_batch.call_count > 0
-        print(f"  파이프라인 완료: processed={stats.processed}, "
-              f"embed 호출={mock_embedder.embed.call_count}회, "
-              f"upsert 호출={mock_indexer.upsert_batch.call_count}회")
+            assert stats.processed == 50
+            assert mock_embedder.embed.call_count > 0
+            assert mock_indexer.upsert_batch.call_count > 0
+            print(f"  파이프라인 완료: processed={stats.processed}, "
+                  f"embed 호출={mock_embedder.embed.call_count}회, "
+                  f"upsert 호출={mock_indexer.upsert_batch.call_count}회")
 
-        # 각 embed 호출에서 올바른 키워드가 전달되었는지 확인
-        first_call_texts = mock_embedder.embed.call_args_list[0][0][0]
-        assert isinstance(first_call_texts, list)
-        assert all(isinstance(t, str) for t in first_call_texts)
-        print(f"  첫 embed 호출: {len(first_call_texts)}건 — '{first_call_texts[0]}'")
+            # 각 embed 호출에서 올바른 키워드가 전달되었는지 확인
+            first_call_texts = mock_embedder.embed.call_args_list[0][0][0]
+            assert isinstance(first_call_texts, list)
+            assert all(isinstance(t, str) for t in first_call_texts)
+            print(f"  첫 embed 호출: {len(first_call_texts)}건 — '{first_call_texts[0]}'")
 
-        # 각 upsert에서 올바른 embeddings shape이 전달되었는지 확인
-        first_upsert = mock_indexer.upsert_batch.call_args_list[0]
-        emb_arg = first_upsert.kwargs["embeddings"]
-        assert emb_arg.shape[1] == 768
-        print(f"  첫 upsert: embeddings shape={emb_arg.shape}")
+            # 각 upsert에서 올바른 embeddings shape이 전달되었는지 확인
+            first_upsert = mock_indexer.upsert_batch.call_args_list[0]
+            emb_arg = first_upsert.kwargs["embeddings"]
+            assert emb_arg.shape[1] == 768
+            print(f"  첫 upsert: embeddings shape={emb_arg.shape}")
 
-        # wall time 확인
-        assert stats.wall_sec > 0
-        print(f"  wall_sec: {stats.wall_sec:.4f}s")
+            # wall time 확인
+            assert stats.wall_sec > 0
+            print(f"  wall_sec: {stats.wall_sec:.4f}s")
+
+    asyncio.run(_run_pipeline_test())
 
     print("  PASS\n")
 
@@ -483,8 +493,8 @@ def test_retry_cross_package():
         print(f"  ES 스타일: 3번 실패 후 종료 (기록={len(lines)}건)  OK")
 
         # 같은 클래스 사용 확인
-        from qdrant_indexer.pipeline import _create_batch_processor
-        # _create_batch_processor 내부에서 with_retry를 사용
+        from qdrant_indexer.pipeline import _process_batch
+        # _process_batch 내부에서 AsyncFailureLogger를 사용
         # → kserve_embed_client.retry에서 import
         assert qdrant_rc.__class__.__name__ == "RetryConfig"
         assert qdrant_fl.__class__.__name__ == "FailureLogger"

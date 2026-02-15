@@ -60,6 +60,26 @@ class QdrantIndexer:
 
         self.client.create_collection(**kwargs)
 
+    def ensure_collection(self) -> bool:
+        """
+        컬렉션이 없을 때만 생성 (기존 데이터 보존).
+
+        Returns:
+            True면 새로 생성됨, False면 이미 존재.
+        """
+        existing = [c.name for c in self.client.get_collections().collections]
+        if self.collection_name in existing:
+            return False
+
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(
+                size=self.vector_dim,
+                distance=Distance.COSINE,
+            ),
+        )
+        return True
+
     def finalize(self, indexing_threshold: int = 20000):
         """
         벌크 업로드 완료 후 HNSW 인덱싱 활성화 + 완료 대기.
@@ -155,13 +175,96 @@ class AsyncQdrantIndexer:
     Qdrant 벡터 DB 인덱서 (Async).
 
     asyncio 이벤트 루프에서 직접 I/O를 다중화하여
-    ThreadPoolExecutor 없이 동시 검색을 수행.
+    ThreadPoolExecutor 없이 동시 인덱싱/검색을 수행.
     """
 
     def __init__(self, url: str, collection_name: str, vector_dim: int):
+        self.url = url
         self.client = AsyncQdrantClient(url=url)
         self.collection_name = collection_name
         self.vector_dim = vector_dim
+
+    # ── 컬렉션 관리 ─────────────────────────────────
+
+    async def create_collection(self, bulk_mode: bool = False):
+        """컬렉션 생성 (이미 존재하면 삭제 후 재생성)."""
+        existing = [c.name for c in (await self.client.get_collections()).collections]
+        if self.collection_name in existing:
+            await self.client.delete_collection(self.collection_name)
+
+        kwargs: dict = {
+            "collection_name": self.collection_name,
+            "vectors_config": VectorParams(
+                size=self.vector_dim,
+                distance=Distance.COSINE,
+            ),
+        }
+        if bulk_mode:
+            kwargs["optimizers_config"] = OptimizersConfigDiff(indexing_threshold=0)
+
+        await self.client.create_collection(**kwargs)
+
+    async def ensure_collection(self) -> bool:
+        """컬렉션이 없을 때만 생성. True면 신규 생성, False면 이미 존재."""
+        existing = [c.name for c in (await self.client.get_collections()).collections]
+        if self.collection_name in existing:
+            return False
+
+        await self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(
+                size=self.vector_dim,
+                distance=Distance.COSINE,
+            ),
+        )
+        return True
+
+    async def finalize(self, indexing_threshold: int = 20000):
+        """벌크 업로드 완료 후 HNSW 인덱싱 활성화 + 완료 대기."""
+        await self.client.update_collection(
+            collection_name=self.collection_name,
+            optimizers_config=OptimizersConfigDiff(
+                indexing_threshold=indexing_threshold,
+            ),
+        )
+
+        logger.info(
+            f"인덱싱 활성화 (indexing_threshold={indexing_threshold}), "
+            "완료 대기 중..."
+        )
+
+        last_log = time.monotonic()
+        while True:
+            info = await self.client.get_collection(self.collection_name)
+            status = info.optimizer_status.status
+            if status == "ok":
+                break
+            now = time.monotonic()
+            if now - last_log >= 30:
+                logger.info(
+                    f"인덱싱 진행 중... "
+                    f"(vectors={info.points_count:,}, status={status})"
+                )
+                last_log = now
+            await asyncio.sleep(2.0)
+
+        logger.info("인덱싱 완료")
+
+    # ── 데이터 저장 ─────────────────────────────────
+
+    async def upsert_batch(self, start_id: int, keywords: list[str], embeddings: np.ndarray):
+        """키워드 + 임베딩 → Qdrant 포인트로 비동기 저장."""
+        points = [
+            PointStruct(
+                id=start_id + i,
+                vector=embeddings[i].tolist(),
+                payload={"keyword": keywords[i]},
+            )
+            for i in range(len(keywords))
+        ]
+        await self.client.upsert(collection_name=self.collection_name, points=points)
+
+    # ── 검색 ────────────────────────────────────────
 
     async def search(self, query_vector: list[float], top_k: int = 5):
         """단건 비동기 검색"""
@@ -172,11 +275,7 @@ class AsyncQdrantIndexer:
         )
 
     async def search_batch(self, query_vectors: list[list[float]], top_k: int = 5):
-        """
-        배치 비동기 검색 (query_batch_points).
-
-        1번의 HTTP 호출로 N개 쿼리를 동시에 검색.
-        """
+        """배치 비동기 검색 — 1번의 HTTP 호출로 N개 쿼리."""
         requests = [
             QueryRequest(query=vec, limit=top_k, with_payload=True)
             for vec in query_vectors
@@ -186,13 +285,20 @@ class AsyncQdrantIndexer:
             requests=requests,
         )
 
-    async def close(self):
-        await self.client.close()
+    # ── 상태 확인 ───────────────────────────────────
+
+    async def get_count(self) -> int:
+        """비동기 포인트 수 조회."""
+        info = await self.client.get_collection(self.collection_name)
+        return info.points_count
 
     @property
     def count(self) -> int:
-        """동기적으로 카운트 조회 (초기화 시 사용)"""
-        sync_client = QdrantClient(url=self.client._client.rest_uri)
+        """동기적으로 카운트 조회 (초기화 시 사용)."""
+        sync_client = QdrantClient(url=self.url)
         c = sync_client.get_collection(self.collection_name).points_count
         sync_client.close()
         return c
+
+    async def close(self):
+        await self.client.close()
