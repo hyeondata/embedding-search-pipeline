@@ -30,6 +30,7 @@ class SearchResult:
     score: float
     keyword: str
     point_id: int
+    payload: dict | None = None
 
 
 class Searcher:
@@ -78,8 +79,9 @@ class Searcher:
             SearchResult(
                 rank=i + 1,
                 score=point.score,
-                keyword=point.payload["keyword"],
+                keyword=point.payload.get("keyword", ""),
                 point_id=point.id,
+                payload=point.payload,
             )
             for i, point in enumerate(response.points)
         ]
@@ -112,8 +114,9 @@ class Searcher:
                 SearchResult(
                     rank=i + 1,
                     score=point.score,
-                    keyword=point.payload["keyword"],
+                    keyword=point.payload.get("keyword", ""),
                     point_id=point.id,
+                    payload=point.payload,
                 )
                 for i, point in enumerate(responses[idx].points)
             ]
@@ -152,8 +155,9 @@ async def _async_search_batch(
                 {
                     "rank": i + 1,
                     "score": round(point.score, 6),
-                    "keyword": point.payload["keyword"],
+                    "keyword": point.payload.get("keyword", ""),
                     "point_id": point.id,
+                    "payload": point.payload,
                 }
                 for i, point in enumerate(responses[idx].points)
             ],

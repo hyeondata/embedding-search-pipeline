@@ -144,15 +144,36 @@ class ESIndexer:
     # Bulk 인덱싱
     # ================================================================
 
-    async def bulk_index(self, start_id: int, keywords: list[str]):
-        """키워드 리스트 → ES 도큐먼트로 벌크 저장"""
+    async def bulk_index(
+        self,
+        start_id: int,
+        keywords: list[str],
+        *,
+        ids: list[str] | None = None,
+        documents: list[dict] | None = None,
+    ):
+        """키워드 리스트 → ES 도큐먼트로 벌크 저장.
+
+        Args:
+            start_id: 자동 증가 ID의 시작값 (ids 미지정 시 사용).
+            keywords: 키워드 리스트 (documents 미지정 시 _source로 사용).
+            ids: 커스텀 문서 ID 리스트. None이면 str(start_id + i) 자동 생성.
+            documents: 커스텀 _source 리스트. None이면 {"keyword": kw}로 생성.
+        """
+        n = len(documents) if documents is not None else len(keywords)
+
+        if ids is not None and len(ids) != n:
+            raise ValueError(
+                f"ids 길이({len(ids)})와 문서 수({n})가 일치하지 않습니다"
+            )
+
         actions = [
             {
                 "_index": self.index_name,
-                "_id": str(start_id + i),
-                "_source": {"keyword": keywords[i]},
+                "_id": ids[i] if ids is not None else str(start_id + i),
+                "_source": documents[i] if documents is not None else {"keyword": keywords[i]},
             }
-            for i in range(len(keywords))
+            for i in range(n)
         ]
         success, errors = await async_bulk(
             self.es, actions, chunk_size=len(actions), raise_on_error=False
@@ -189,12 +210,23 @@ class ESIndexer:
     # Realtime CRUD
     # ================================================================
 
-    async def index(self, doc_id: str, keyword: str, refresh: bool = True):
-        """단일 문서 인덱싱 (upsert)."""
+    async def index(
+        self, doc_id: str, keyword: str, refresh: bool = True,
+        *, document: dict | None = None,
+    ):
+        """단일 문서 인덱싱 (upsert).
+
+        Args:
+            doc_id: 문서 ID.
+            keyword: 키워드 (document 미지정 시 {"keyword": keyword}로 사용).
+            refresh: True면 즉시 리프레시.
+            document: 커스텀 _source 딕셔너리. None이면 {"keyword": keyword}.
+        """
+        doc = document if document is not None else {"keyword": keyword}
         await self.es.index(
             index=self.index_name,
             id=doc_id,
-            document={"keyword": keyword},
+            document=doc,
             refresh="true" if refresh else "false",
         )
 

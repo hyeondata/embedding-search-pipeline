@@ -416,12 +416,152 @@ def test_async_process_batch():
     print("  PASS\n")
 
 
+def test_custom_payloads():
+    """QdrantIndexer: 커스텀 ids + payloads 파라미터 검증"""
+    print("=" * 60)
+    print("[6] QdrantIndexer — 커스텀 ids + payloads")
+    print("=" * 60)
+
+    with patch("qdrant_indexer.indexer.QdrantClient") as MockClient:
+        mock_client = MockClient.return_value
+        indexer = QdrantIndexer("http://localhost:6333", "test_col", 768)
+
+        # 커스텀 ids + payloads
+        embeddings = np.random.randn(3, 768)
+        indexer.upsert_batch(
+            start_id=0,
+            keywords=["ignored"],
+            embeddings=embeddings,
+            ids=["uuid-a", "uuid-b", "uuid-c"],
+            payloads=[
+                {"product_name": "商品A", "category": "食品", "price": 1000},
+                {"product_name": "商品B", "category": "飲料", "price": 2000},
+                {"product_name": "商品C", "category": "菓子", "price": 3000},
+            ],
+        )
+        points = mock_client.upsert.call_args.kwargs["points"]
+        assert len(points) == 3
+        assert points[0].id == "uuid-a"
+        assert points[0].payload["product_name"] == "商品A"
+        assert points[1].id == "uuid-b"
+        assert points[2].payload["price"] == 3000
+        print(f"  upsert_batch(custom): ids=[uuid-a..c], payloads OK")
+
+        # 하위호환: 기존 keyword 모드
+        mock_client.reset_mock()
+        indexer.upsert_batch(
+            start_id=100,
+            keywords=["東京", "大阪"],
+            embeddings=np.random.randn(2, 768),
+        )
+        points = mock_client.upsert.call_args.kwargs["points"]
+        assert points[0].id == 100
+        assert points[0].payload == {"keyword": "東京"}
+        assert points[1].id == 101
+        print(f"  upsert_batch(기본): 하위호환 OK")
+
+        # ids만 커스텀 (payloads는 keyword 기반)
+        mock_client.reset_mock()
+        indexer.upsert_batch(
+            start_id=0,
+            keywords=["東京", "大阪"],
+            embeddings=np.random.randn(2, 768),
+            ids=[999, 1000],
+        )
+        points = mock_client.upsert.call_args.kwargs["points"]
+        assert points[0].id == 999
+        assert points[0].payload == {"keyword": "東京"}
+        print(f"  ids만 커스텀: id=999, payload=keyword 기반  OK")
+
+        # ids 길이 불일치 → ValueError
+        try:
+            indexer.upsert_batch(
+                start_id=0, keywords=[], embeddings=np.random.randn(3, 768),
+                ids=["a", "b"],
+            )
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "ids" in str(e)
+            print(f"  ids 길이 불일치 → ValueError: OK")
+
+        # payloads 길이 불일치 → ValueError
+        try:
+            indexer.upsert_batch(
+                start_id=0, keywords=[], embeddings=np.random.randn(3, 768),
+                payloads=[{"a": 1}],
+            )
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "payloads" in str(e)
+            print(f"  payloads 길이 불일치 → ValueError: OK")
+
+    print("  PASS\n")
+
+
+def test_async_custom_payloads():
+    """AsyncQdrantIndexer: 커스텀 ids + payloads 파라미터 검증 (비동기)"""
+    print("=" * 60)
+    print("[7] AsyncQdrantIndexer — 커스텀 ids + payloads")
+    print("=" * 60)
+
+    async def _run():
+        with patch("qdrant_indexer.indexer.AsyncQdrantClient"):
+            indexer = AsyncQdrantIndexer("http://localhost:6333", "test_col", 768)
+            indexer.client = AsyncMock()
+
+            # 커스텀 ids + payloads
+            embeddings = np.random.randn(3, 768)
+            await indexer.upsert_batch(
+                start_id=0,
+                keywords=[],
+                embeddings=embeddings,
+                ids=[1001, 1002, 1003],
+                payloads=[
+                    {"text": "hello", "lang": "en"},
+                    {"text": "world", "lang": "en"},
+                    {"text": "こんにちは", "lang": "ja"},
+                ],
+            )
+            points = indexer.client.upsert.call_args.kwargs["points"]
+            assert points[0].id == 1001
+            assert points[0].payload["text"] == "hello"
+            assert points[2].payload["lang"] == "ja"
+            print(f"  async upsert_batch(custom): ids + payloads OK")
+
+            # 하위호환
+            indexer.client.reset_mock()
+            await indexer.upsert_batch(
+                start_id=200,
+                keywords=["a", "b"],
+                embeddings=np.random.randn(2, 768),
+            )
+            points = indexer.client.upsert.call_args.kwargs["points"]
+            assert points[0].id == 200
+            assert points[0].payload == {"keyword": "a"}
+            print(f"  async upsert_batch(기본): 하위호환 OK")
+
+            # ids 길이 불일치 → ValueError
+            try:
+                await indexer.upsert_batch(
+                    start_id=0, keywords=[], embeddings=np.random.randn(3, 768),
+                    ids=["a"],
+                )
+                assert False, "Should have raised ValueError"
+            except ValueError:
+                print(f"  async ids 길이 불일치 → ValueError: OK")
+
+    asyncio.run(_run())
+    print("  PASS\n")
+
+
 if __name__ == "__main__":
     test_config()
     test_qdrant_indexer()
     test_searcher()
     test_pipeline_stats()
     test_async_process_batch()
+    test_custom_payloads()
+    test_async_custom_payloads()
 
     print("=" * 60)
     print("ALL qdrant-indexer EXAMPLES PASSED")

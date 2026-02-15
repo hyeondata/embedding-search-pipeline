@@ -382,6 +382,100 @@ def test_load_keywords():
     print("  PASS\n")
 
 
+def test_custom_documents():
+    """ESIndexer: 커스텀 ids + documents 파라미터 검증"""
+    print("=" * 60)
+    print("[8] ESIndexer — 커스텀 ids + documents")
+    print("=" * 60)
+
+    with patch("es_indexer.indexer.AsyncElasticsearch") as MockES:
+        mock_es = MockES.return_value
+        mock_es.indices = MagicMock()
+        mock_es.indices.exists = AsyncMock(return_value=False)
+        mock_es.indices.create = AsyncMock()
+
+        indexer = ESIndexer("http://localhost:9200", "test_idx")
+
+        # bulk_index: 커스텀 ids + documents
+        with patch("es_indexer.indexer.async_bulk", new_callable=AsyncMock) as mock_bulk:
+            mock_bulk.return_value = (3, [])
+
+            asyncio.run(indexer.bulk_index(
+                0, [],
+                ids=["prod-001", "prod-002", "prod-003"],
+                documents=[
+                    {"name": "商品A", "price": 1000, "category": "食品"},
+                    {"name": "商品B", "price": 2000, "category": "飲料"},
+                    {"name": "商品C", "price": 3000, "category": "菓子"},
+                ],
+            ))
+
+            actions = mock_bulk.call_args[0][1]
+            assert len(actions) == 3
+            assert actions[0]["_id"] == "prod-001"
+            assert actions[0]["_source"]["name"] == "商品A"
+            assert actions[1]["_id"] == "prod-002"
+            assert actions[2]["_source"]["price"] == 3000
+            print(f"  bulk_index(custom): ids=[prod-001..003], documents OK")
+
+        # bulk_index: 하위호환 (기존 keyword 모드)
+        with patch("es_indexer.indexer.async_bulk", new_callable=AsyncMock) as mock_bulk:
+            mock_bulk.return_value = (2, [])
+
+            asyncio.run(indexer.bulk_index(100, ["キーワードA", "キーワードB"]))
+
+            actions = mock_bulk.call_args[0][1]
+            assert actions[0]["_id"] == "100"
+            assert actions[0]["_source"] == {"keyword": "キーワードA"}
+            assert actions[1]["_id"] == "101"
+            print(f"  bulk_index(기본): 하위호환 OK")
+
+        # bulk_index: ids만 커스텀 (documents는 keyword 기반)
+        with patch("es_indexer.indexer.async_bulk", new_callable=AsyncMock) as mock_bulk:
+            mock_bulk.return_value = (2, [])
+
+            asyncio.run(indexer.bulk_index(
+                0, ["東京", "大阪"],
+                ids=["city-001", "city-002"],
+            ))
+
+            actions = mock_bulk.call_args[0][1]
+            assert actions[0]["_id"] == "city-001"
+            assert actions[0]["_source"] == {"keyword": "東京"}
+            print(f"  ids만 커스텀: id=city-001, source=keyword 기반  OK")
+
+        # bulk_index: ids 길이 불일치 → ValueError
+        with patch("es_indexer.indexer.async_bulk", new_callable=AsyncMock) as mock_bulk:
+            try:
+                asyncio.run(indexer.bulk_index(
+                    0, ["a", "b", "c"],
+                    ids=["x", "y"],
+                ))
+                assert False, "Should have raised ValueError"
+            except ValueError as e:
+                assert "ids" in str(e)
+                print(f"  ids 길이 불일치 → ValueError: OK")
+
+        # index: 커스텀 document
+        mock_es.index = AsyncMock()
+        asyncio.run(indexer.index(
+            "prod-001", "",
+            document={"name": "商品A", "price": 1000},
+        ))
+        call_kwargs = mock_es.index.call_args.kwargs
+        assert call_kwargs["document"] == {"name": "商品A", "price": 1000}
+        assert call_kwargs["id"] == "prod-001"
+        print(f"  index(custom document): OK")
+
+        # index: 하위호환
+        asyncio.run(indexer.index("1", "テスト"))
+        call_kwargs = mock_es.index.call_args.kwargs
+        assert call_kwargs["document"] == {"keyword": "テスト"}
+        print(f"  index(기본): 하위호환 OK")
+
+    print("  PASS\n")
+
+
 if __name__ == "__main__":
     test_config()
     test_default_schema()
@@ -390,6 +484,7 @@ if __name__ == "__main__":
     test_from_config()
     test_async_failure_logger()
     test_load_keywords()
+    test_custom_documents()
 
     print("=" * 60)
     print("ALL es-indexer EXAMPLES PASSED")

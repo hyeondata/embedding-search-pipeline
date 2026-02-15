@@ -119,15 +119,42 @@ class QdrantIndexer:
 
     # ── 데이터 저장 ─────────────────────────────────
 
-    def upsert_batch(self, start_id: int, keywords: list[str], embeddings: np.ndarray):
-        """키워드 + 임베딩 → Qdrant 포인트로 저장"""
+    def upsert_batch(
+        self,
+        start_id: int,
+        keywords: list[str],
+        embeddings: np.ndarray,
+        *,
+        ids: list[int | str] | None = None,
+        payloads: list[dict] | None = None,
+    ):
+        """키워드 + 임베딩 → Qdrant 포인트로 저장.
+
+        Args:
+            start_id: 자동 증가 ID의 시작값 (ids 미지정 시 사용).
+            keywords: 키워드 리스트 (payloads 미지정 시 payload로 사용).
+            embeddings: 임베딩 벡터 배열 (shape: [n, dim]).
+            ids: 커스텀 포인트 ID 리스트. None이면 start_id 기반 자동 생성.
+            payloads: 커스텀 payload 리스트. None이면 {"keyword": kw}로 생성.
+        """
+        n = len(embeddings)
+
+        if ids is not None and len(ids) != n:
+            raise ValueError(
+                f"ids 길이({len(ids)})와 embeddings 수({n})가 일치하지 않습니다"
+            )
+        if payloads is not None and len(payloads) != n:
+            raise ValueError(
+                f"payloads 길이({len(payloads)})와 embeddings 수({n})가 일치하지 않습니다"
+            )
+
         points = [
             PointStruct(
-                id=start_id + i,
+                id=ids[i] if ids is not None else start_id + i,
                 vector=embeddings[i].tolist(),
-                payload={"keyword": keywords[i]},
+                payload=payloads[i] if payloads is not None else {"keyword": keywords[i]},
             )
-            for i in range(len(keywords))
+            for i in range(n)
         ]
         self.client.upsert(collection_name=self.collection_name, points=points)
 
@@ -252,15 +279,42 @@ class AsyncQdrantIndexer:
 
     # ── 데이터 저장 ─────────────────────────────────
 
-    async def upsert_batch(self, start_id: int, keywords: list[str], embeddings: np.ndarray):
-        """키워드 + 임베딩 → Qdrant 포인트로 비동기 저장."""
+    async def upsert_batch(
+        self,
+        start_id: int,
+        keywords: list[str],
+        embeddings: np.ndarray,
+        *,
+        ids: list[int | str] | None = None,
+        payloads: list[dict] | None = None,
+    ):
+        """키워드 + 임베딩 → Qdrant 포인트로 비동기 저장.
+
+        Args:
+            start_id: 자동 증가 ID의 시작값 (ids 미지정 시 사용).
+            keywords: 키워드 리스트 (payloads 미지정 시 payload로 사용).
+            embeddings: 임베딩 벡터 배열 (shape: [n, dim]).
+            ids: 커스텀 포인트 ID 리스트. None이면 start_id 기반 자동 생성.
+            payloads: 커스텀 payload 리스트. None이면 {"keyword": kw}로 생성.
+        """
+        n = len(embeddings)
+
+        if ids is not None and len(ids) != n:
+            raise ValueError(
+                f"ids 길이({len(ids)})와 embeddings 수({n})가 일치하지 않습니다"
+            )
+        if payloads is not None and len(payloads) != n:
+            raise ValueError(
+                f"payloads 길이({len(payloads)})와 embeddings 수({n})가 일치하지 않습니다"
+            )
+
         points = [
             PointStruct(
-                id=start_id + i,
+                id=ids[i] if ids is not None else start_id + i,
                 vector=embeddings[i].tolist(),
-                payload={"keyword": keywords[i]},
+                payload=payloads[i] if payloads is not None else {"keyword": keywords[i]},
             )
-            for i in range(len(keywords))
+            for i in range(n)
         ]
         await self.client.upsert(collection_name=self.collection_name, points=points)
 
