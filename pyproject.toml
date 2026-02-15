@@ -8,6 +8,7 @@ dependencies = [
     "kserve-embed-client",
     "qdrant-indexer",
     "es-indexer",
+    "aiohttp>=3.13.3",
 ]
 
 [tool.uv]

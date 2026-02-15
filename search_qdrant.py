@@ -105,6 +105,7 @@ def main():
     # KServe
     parser.add_argument("--kserve_url", default="http://localhost:8000", help="KServe 서비스 URL")
     parser.add_argument("--model_name", default="ruri_v3", help="모델 이름")
+    parser.add_argument("--timeout", type=int, default=120, help="임베딩 HTTP 타임아웃 (초, 기본: 120)")
 
     # 배치 검색 옵션
     parser.add_argument("--file", "-f", type=Path, help="배치 검색: 쿼리 파일 경로 (줄바꿈 구분)")
@@ -116,7 +117,7 @@ def main():
     args = parser.parse_args()
 
     # 임베딩 클라이언트 생성
-    client = EmbeddingClient(args.kserve_url, args.model_name)
+    client = EmbeddingClient(args.kserve_url, args.model_name, timeout=args.timeout)
 
     config = Config(
         collection_name=args.collection,

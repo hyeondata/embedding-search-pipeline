@@ -45,6 +45,7 @@ def main():
     # KServe
     parser.add_argument("--kserve_url", default="http://localhost:8000", help="KServe 서비스 URL")
     parser.add_argument("--model_name", default="ruri_v3", help="모델 이름")
+    parser.add_argument("--timeout", type=int, default=120, help="임베딩 HTTP 타임아웃 (초, 기본: 120)")
 
     # 재시도
     parser.add_argument("--max_retries", type=int, default=3, help="배치당 최대 재시도 횟수 (기본: 3)")
@@ -84,7 +85,7 @@ def main():
     config = Config(**config_kwargs)
 
     # 임베딩 클라이언트 생성
-    client = EmbeddingClient(args.kserve_url, args.model_name)
+    client = EmbeddingClient(args.kserve_url, args.model_name, timeout=args.timeout)
 
     console.rule("[bold]키워드 임베딩 → Qdrant 인덱싱 (Concurrent + Retry)[/bold]")
 

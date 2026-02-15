@@ -275,7 +275,7 @@ async def _run(args):
 
     # [2/5] 클라이언트 초기화
     print("\n  [2/5] 클라이언트 초기화")
-    embedder = EmbeddingClient(args.kserve_url, args.model)
+    embedder = EmbeddingClient(args.kserve_url, args.model, timeout=args.timeout)
     qdrant = AsyncQdrantIndexer(args.qdrant_url, args.collection, 768)
 
     es_config = ESConfig(
@@ -404,6 +404,7 @@ def main():
     parser.add_argument("--es_url", default="http://localhost:9200")
 
     parser.add_argument("--model", default="ruri_v3")
+    parser.add_argument("--timeout", type=int, default=120, help="임베딩 HTTP 타임아웃 (초, default: 120)")
     parser.add_argument("--collection", default="keywords")
     parser.add_argument("--index", default="product_keywords")
     parser.add_argument("--payload_key", default="keyword",
