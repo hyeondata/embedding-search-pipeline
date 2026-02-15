@@ -85,10 +85,20 @@ class ESIndexer:
     # 인덱스 관리
     # ================================================================
 
-    async def create_index(self, schema: dict | None = None):
+    async def create_index(
+        self,
+        schema: dict | None = None,
+        bulk_config: dict | None = None,
+    ):
         """
         인덱스 생성 (이미 존재하면 삭제 후 재생성).
         벌크 최적화 설정(refresh=-1, translog=async)을 자동 적용.
+
+        Args:
+            schema: 인덱스 스키마 (None → DEFAULT_SCHEMA)
+            bulk_config: 벌크 모드 추가 최적화. 예:
+                {"number_of_replicas": 0, "flush_threshold_size": "1gb",
+                 "replicas_restore": 0}
         """
         if await self.es.indices.exists(index=self.index_name):
             await self.es.indices.delete(index=self.index_name)
@@ -98,6 +108,14 @@ class ESIndexer:
         settings.setdefault("refresh_interval", "-1")
         settings.setdefault("index.translog.durability", "async")
         settings.setdefault("index.translog.sync_interval", "30s")
+
+        # 벌크 모드 추가 최적화
+        self._bulk_config = bulk_config
+        if bulk_config:
+            settings["number_of_replicas"] = bulk_config.get("number_of_replicas", 0)
+            settings["index.translog.flush_threshold_size"] = bulk_config.get(
+                "flush_threshold_size", "1gb"
+            )
 
         await self.es.indices.create(
             index=self.index_name,
@@ -144,13 +162,23 @@ class ESIndexer:
         return success
 
     async def finalize(self):
-        """Bulk 완료 후: refresh 복원 + translog 동기화 + force merge"""
+        """Bulk 완료 후: refresh 복원 + translog 동기화 + replicas 복원 + force merge"""
+        restore_settings: dict = {
+            "index.refresh_interval": "1s",
+            "index.translog.durability": "request",
+        }
+
+        # 벌크 모드 설정 복원
+        bulk_config = getattr(self, "_bulk_config", None)
+        if bulk_config:
+            restore_settings["number_of_replicas"] = bulk_config.get(
+                "replicas_restore", 0
+            )
+            restore_settings["index.translog.flush_threshold_size"] = "512mb"
+
         await self.es.indices.put_settings(
             index=self.index_name,
-            settings={
-                "index.refresh_interval": "1s",
-                "index.translog.durability": "request",
-            },
+            settings=restore_settings,
         )
         await self.es.indices.refresh(index=self.index_name)
         await self.es.indices.forcemerge(

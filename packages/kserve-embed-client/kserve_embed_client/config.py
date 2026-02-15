@@ -42,3 +42,6 @@ class BaseConfig:
     # 실패 로깅
     log_failures: bool = True
     failure_log_path: Path | None = None
+
+    # 벌크 모드 (초기 대량 적재 최적화)
+    bulk_mode: bool = False

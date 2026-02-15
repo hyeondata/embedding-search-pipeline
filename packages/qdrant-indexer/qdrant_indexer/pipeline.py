@@ -81,7 +81,8 @@ def run_indexing(config: Config, log_path: Path = None):
     logger.info(f"config: {config}")
 
     # 1. 키워드 로드
-    logger.info("[bold]\\[1/4] 데이터 로드[/bold]")
+    total_steps = 5 if config.bulk_mode else 4
+    logger.info(f"[bold]\\[1/{total_steps}] 데이터 로드[/bold]")
 
     if config.parquet_path:
         reader = ParquetReader(
@@ -104,10 +105,15 @@ def run_indexing(config: Config, log_path: Path = None):
         data_source = "text"
 
     # 2. Qdrant 컬렉션 생성
-    logger.info(f"[bold]\\[2/4] Qdrant 컬렉션: {config.collection_name}[/bold]")
+    total_steps = 5 if config.bulk_mode else 4
+    mode_label = " bulk_mode" if config.bulk_mode else ""
+    logger.info(f"[bold]\\[2/{total_steps}] Qdrant 컬렉션: {config.collection_name}{mode_label}[/bold]")
     indexer = QdrantIndexer(config.qdrant_url, config.collection_name, config.vector_dim)
-    indexer.create_collection()
-    logger.info(f"생성 완료 (dim={config.vector_dim}, COSINE)")
+    indexer.create_collection(bulk_mode=config.bulk_mode)
+    if config.bulk_mode:
+        logger.info(f"생성 완료 (dim={config.vector_dim}, COSINE, indexing_threshold=0)")
+    else:
+        logger.info(f"생성 완료 (dim={config.vector_dim}, COSINE)")
 
     # 3. 재시도 + 실패 로깅 설정
     retry_config = RetryConfig(
@@ -127,7 +133,7 @@ def run_indexing(config: Config, log_path: Path = None):
 
     # 4. 동시 배치 처리
     logger.info(
-        f"[bold]\\[3/4] 동시 인덱싱[/bold] "
+        f"[bold]\\[3/{total_steps}] 동시 인덱싱[/bold] "
         f"(workers=[cyan]{config.workers}[/cyan], batch=[cyan]{config.batch_size}[/cyan])"
     )
     embedder = EmbeddingClient(config.kserve_url, config.model_name)
@@ -164,8 +170,17 @@ def run_indexing(config: Config, log_path: Path = None):
 
     wall = stats.wall_sec
 
+    # 4a. 벌크 모드 인덱싱 복원
+    if config.bulk_mode:
+        step = total_steps - 1
+        logger.info(
+            f"[bold]\\[{step}/{total_steps}] 인덱싱 복원[/bold] "
+            f"(indexing_threshold={config.bulk_indexing_threshold})"
+        )
+        indexer.finalize(indexing_threshold=config.bulk_indexing_threshold)
+
     # 5. 검증
-    logger.info("[bold]\\[4/4] 검증[/bold]")
+    logger.info(f"[bold]\\[{total_steps}/{total_steps}] 검증[/bold]")
     logger.info(f"벡터 수: [cyan]{indexer.count:,}[/cyan]")
     logger.info(f"Wall time: [cyan]{wall:.1f}초[/cyan]")
     logger.info(f"처리량: [bold green]{total / wall:.0f} texts/sec[/bold green]")

@@ -1,10 +1,21 @@
 """Qdrant 컬렉션 관리 + 벡터 저장 + 검색 (Sync + Async)"""
 
 import asyncio
+import logging
+import time
 
 import numpy as np
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import Distance, PointStruct, QueryRequest, VectorParams
+from qdrant_client.models import (
+    Distance,
+    OptimizersConfigDiff,
+    PointStruct,
+    QueryRequest,
+    VectorParams,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class QdrantIndexer:
@@ -22,19 +33,69 @@ class QdrantIndexer:
 
     # ── 컬렉션 관리 ─────────────────────────────────
 
-    def create_collection(self):
-        """컬렉션 생성 (이미 존재하면 삭제 후 재생성)"""
+    def create_collection(self, bulk_mode: bool = False):
+        """
+        컬렉션 생성 (이미 존재하면 삭제 후 재생성).
+
+        Args:
+            bulk_mode: True면 indexing_threshold=0으로 HNSW 인덱싱 비활성화.
+                       대량 업로드 후 finalize()로 인덱싱 활성화 필요.
+        """
         existing = [c.name for c in self.client.get_collections().collections]
         if self.collection_name in existing:
             self.client.delete_collection(self.collection_name)
 
-        self.client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config=VectorParams(
+        kwargs: dict = {
+            "collection_name": self.collection_name,
+            "vectors_config": VectorParams(
                 size=self.vector_dim,
                 distance=Distance.COSINE,
             ),
+        }
+
+        if bulk_mode:
+            kwargs["optimizers_config"] = OptimizersConfigDiff(
+                indexing_threshold=0,
+            )
+
+        self.client.create_collection(**kwargs)
+
+    def finalize(self, indexing_threshold: int = 20000):
+        """
+        벌크 업로드 완료 후 HNSW 인덱싱 활성화 + 완료 대기.
+
+        Args:
+            indexing_threshold: 복원할 indexing_threshold (기본: 20000, Qdrant 기본값)
+        """
+        self.client.update_collection(
+            collection_name=self.collection_name,
+            optimizers_config=OptimizersConfigDiff(
+                indexing_threshold=indexing_threshold,
+            ),
         )
+
+        logger.info(
+            f"인덱싱 활성화 (indexing_threshold={indexing_threshold}), "
+            "완료 대기 중..."
+        )
+
+        last_log = time.monotonic()
+        while True:
+            info = self.client.get_collection(self.collection_name)
+            status = info.optimizer_status.status
+            if status == "ok":
+                break
+            # 30초마다 상태 로그
+            now = time.monotonic()
+            if now - last_log >= 30:
+                logger.info(
+                    f"인덱싱 진행 중... "
+                    f"(vectors={info.points_count:,}, status={status})"
+                )
+                last_log = now
+            time.sleep(2.0)
+
+        logger.info("인덱싱 완료")
 
     # ── 데이터 저장 ─────────────────────────────────
 

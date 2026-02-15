@@ -48,7 +48,12 @@ def test_config():
     assert c.retry_backoff == 1.0
     assert c.retry_exponential is True
     assert c.log_failures is True
+    assert c.bulk_mode is False
+    assert c.bulk_replicas == 0
+    assert c.bulk_replicas_restore == 0
+    assert c.bulk_flush_threshold == "1gb"
     print(f"  BaseConfig 상속: retry_backoff={c.retry_backoff}, exponential={c.retry_exponential}")
+    print(f"  벌크: bulk_mode={c.bulk_mode}, replicas={c.bulk_replicas}, flush={c.bulk_flush_threshold}")
 
     # 클러스터 설정
     c2 = Config(
@@ -200,12 +205,42 @@ def test_es_indexer_crud():
         assert result is True
         print(f"  ensure_index (신규): True  OK")
 
-        # finalize
+        # finalize (기본 — bulk_config 없음)
         asyncio.run(indexer.finalize())
-        mock_es.indices.put_settings.assert_called()
+        put_call = mock_es.indices.put_settings.call_args
+        assert "number_of_replicas" not in put_call.kwargs["settings"]
         mock_es.indices.refresh.assert_called()
         mock_es.indices.forcemerge.assert_called()
         print(f"  finalize: put_settings + refresh + forcemerge  OK")
+
+        # create_index(bulk_config) — 벌크 모드 설정 적용
+        mock_es.indices.reset_mock()
+        mock_es.indices.exists = AsyncMock(return_value=False)
+        mock_es.indices.create = AsyncMock()
+        bulk_config = {
+            "number_of_replicas": 0,
+            "flush_threshold_size": "1gb",
+            "replicas_restore": 1,
+        }
+        asyncio.run(indexer.create_index(bulk_config=bulk_config))
+        create_kwargs = mock_es.indices.create.call_args.kwargs
+        assert create_kwargs["settings"]["number_of_replicas"] == 0
+        assert create_kwargs["settings"]["index.translog.flush_threshold_size"] == "1gb"
+        print(f"  create_index(bulk_config): replicas=0, flush=1gb  OK")
+
+        # finalize — 벌크 모드 설정 복원
+        mock_es.indices.reset_mock()
+        mock_es.indices.put_settings = AsyncMock()
+        mock_es.indices.refresh = AsyncMock()
+        mock_es.indices.forcemerge = AsyncMock()
+        asyncio.run(indexer.finalize())
+        put_call = mock_es.indices.put_settings.call_args
+        restore = put_call.kwargs["settings"]
+        assert restore["number_of_replicas"] == 1  # replicas_restore
+        assert restore["index.translog.flush_threshold_size"] == "512mb"
+        assert restore["index.refresh_interval"] == "1s"
+        assert restore["index.translog.durability"] == "request"
+        print(f"  finalize(bulk): replicas 복원=1, flush=512mb  OK")
 
         # 단건 CRUD
         mock_es.index = AsyncMock()

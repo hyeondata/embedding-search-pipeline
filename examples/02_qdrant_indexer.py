@@ -41,9 +41,12 @@ def test_config():
     assert c.max_retries == 3
     assert c.retry_exponential is True
     assert c.log_failures is True
+    assert c.bulk_mode is False
+    assert c.bulk_indexing_threshold == 20000
     print(f"  기본값: kserve={c.kserve_url}, qdrant={c.qdrant_url}, dim={c.vector_dim}")
     print(f"  처리: batch={c.batch_size}, workers={c.workers}")
     print(f"  재시도: max={c.max_retries}, exponential={c.retry_exponential}")
+    print(f"  벌크: bulk_mode={c.bulk_mode}, indexing_threshold={c.bulk_indexing_threshold}")
 
     # 커스텀
     c2 = Config(
@@ -139,6 +142,50 @@ def test_qdrant_indexer():
         mock_client.get_collection.return_value = mock_collection_info
         assert indexer.count == 40000
         print(f"  count: {indexer.count}  OK")
+
+        # create_collection(bulk_mode=True) — indexing_threshold=0 설정 검증
+        mock_client.reset_mock()
+        mock_collections.collections = []
+        indexer.create_collection(bulk_mode=True)
+        create_call = mock_client.create_collection.call_args
+        opt_config = create_call.kwargs.get("optimizers_config")
+        assert opt_config is not None
+        assert opt_config.indexing_threshold == 0
+        print(f"  create_collection(bulk_mode=True): indexing_threshold=0  OK")
+
+        # create_collection(bulk_mode=False) — optimizers_config 미전달 검증
+        mock_client.reset_mock()
+        indexer.create_collection(bulk_mode=False)
+        create_call = mock_client.create_collection.call_args
+        assert "optimizers_config" not in create_call.kwargs
+        print(f"  create_collection(bulk_mode=False): optimizers_config 없음  OK")
+
+        # finalize — update_collection + 폴링 검증
+        mock_client.reset_mock()
+        mock_info = MagicMock()
+        mock_info.optimizer_status.status = "ok"
+        mock_info.points_count = 40000
+        mock_client.get_collection.return_value = mock_info
+
+        indexer.finalize(indexing_threshold=20000)
+        update_call = mock_client.update_collection.call_args
+        assert update_call.kwargs["collection_name"] == "test_col"
+        assert update_call.kwargs["optimizers_config"].indexing_threshold == 20000
+        print(f"  finalize(20000): update_collection 호출  OK")
+
+        # finalize — 폴링 대기 시뮬레이션 (indexing → ok)
+        mock_client.reset_mock()
+        mock_indexing = MagicMock()
+        mock_indexing.optimizer_status.status = "indexing"
+        mock_indexing.points_count = 30000
+        mock_ok = MagicMock()
+        mock_ok.optimizer_status.status = "ok"
+        mock_ok.points_count = 40000
+        mock_client.get_collection.side_effect = [mock_indexing, mock_ok]
+
+        indexer.finalize(indexing_threshold=15000)
+        assert mock_client.get_collection.call_count == 2
+        print(f"  finalize 폴링: indexing → ok (2회 조회)  OK")
 
     print("  PASS\n")
 

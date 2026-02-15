@@ -22,6 +22,9 @@ class Config(BaseConfig):
     collection_name: str = "keywords"
     vector_dim: int = 768
 
+    # 벌크 최적화 설정 (bulk_mode=True 일 때만 적용)
+    bulk_indexing_threshold: int = 20000  # finalize 시 복원할 indexing_threshold
+
     # 실패 로깅 — 기본 경로 오버라이드
     failure_log_path: Path = field(
         default_factory=lambda: Path(__file__).parent.parent / "logs" / "failures.jsonl"

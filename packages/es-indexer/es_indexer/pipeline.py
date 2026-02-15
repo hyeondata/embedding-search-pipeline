@@ -224,10 +224,28 @@ async def _run_bulk(config: Config, log_path: Path | None = None):
 
     # [2/4] ES 인덱스 재생성
     schema_label = "custom" if config.schema else "default"
-    logger.info(f"[2/4] ES 인덱스: {config.index_name} (schema={schema_label})")
+    mode_label = " bulk_mode" if config.bulk_mode else ""
+    logger.info(f"[2/4] ES 인덱스: {config.index_name} (schema={schema_label}{mode_label})")
     indexer = ESIndexer.from_config(config)
-    await indexer.create_index(config.schema)
-    logger.info("생성 완료 (refresh=-1, translog=async)")
+
+    bulk_config = None
+    if config.bulk_mode:
+        bulk_config = {
+            "number_of_replicas": config.bulk_replicas,
+            "flush_threshold_size": config.bulk_flush_threshold,
+            "replicas_restore": config.bulk_replicas_restore,
+        }
+
+    await indexer.create_index(config.schema, bulk_config=bulk_config)
+
+    if config.bulk_mode:
+        logger.info(
+            f"생성 완료 (refresh=-1, translog=async, "
+            f"replicas={config.bulk_replicas}, "
+            f"flush_threshold={config.bulk_flush_threshold})"
+        )
+    else:
+        logger.info("생성 완료 (refresh=-1, translog=async)")
 
     # [3/4] 동시 배치 처리
     logger.info(

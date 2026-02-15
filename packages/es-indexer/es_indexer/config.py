@@ -46,6 +46,11 @@ class Config(BaseConfig):
     index_name: str = "keywords"
     schema: dict | None = None  # None → DEFAULT_SCHEMA 사용
 
+    # 벌크 최적화 설정 (bulk_mode=True 일 때만 적용)
+    bulk_replicas: int = 0              # 벌크 중 replicas (0=복제 비활성)
+    bulk_replicas_restore: int = 0      # finalize 시 복원할 replicas 수
+    bulk_flush_threshold: str = "1gb"   # translog.flush_threshold_size (기본 512mb → 1gb)
+
     # 실패 로깅 — 기본 경로 오버라이드
     failure_log_path: Path = field(
         default_factory=lambda: Path(__file__).parent.parent / "logs" / "failures.jsonl"
