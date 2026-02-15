@@ -17,11 +17,12 @@ Realtime 모드 (운영 중 추가):
     await indexer.search("ラーメン")
 """
 
-from .config import Config, DEFAULT_SCHEMA
+from .config import Config, DEFAULT_SCHEMA, build_default_schema
 from .indexer import ESIndexer, build_es_client
 from .pipeline import run_indexing, run_realtime
 
 __all__ = [
-    "Config", "DEFAULT_SCHEMA", "ESIndexer", "build_es_client",
+    "Config", "DEFAULT_SCHEMA", "build_default_schema",
+    "ESIndexer", "build_es_client",
     "run_indexing", "run_realtime",
 ]

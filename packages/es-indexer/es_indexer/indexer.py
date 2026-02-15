@@ -257,11 +257,17 @@ class ESIndexer:
     # 검색
     # ================================================================
 
-    async def search(self, query: str, size: int = 10):
-        """keyword 필드에 대한 전문 검색"""
+    async def search(self, query: str, size: int = 10, *, field: str = "keyword"):
+        """텍스트 필드에 대한 전문 검색.
+
+        Args:
+            query: 검색 텍스트.
+            size: 반환할 결과 수.
+            field: 검색 대상 필드 이름 (기본: "keyword").
+        """
         return await self.es.search(
             index=self.index_name,
-            query={"match": {"keyword": query}},
+            query={"match": {field: query}},
             size=size,
         )
 

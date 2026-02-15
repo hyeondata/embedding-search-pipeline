@@ -115,8 +115,8 @@ async def bench_stages(products: list[str], args):
         doc = {
             "product_name": product,
             "keywords": [
-                {"keyword": pt.payload["keyword"], "keyword_id": pt.id,
-                 "score": round(pt.score, 6)}
+                {"keyword": pt.payload.get(args.payload_key, ""),
+                 "keyword_id": pt.id, "score": round(pt.score, 6)}
                 for pt in points
             ],
         }
@@ -202,8 +202,8 @@ async def bench_optimized_pipeline(products: list[str], args):
                 doc = {
                     "product_name": product,
                     "keywords": [
-                        {"keyword": pt.payload["keyword"], "keyword_id": pt.id,
-                         "score": round(pt.score, 6)}
+                        {"keyword": pt.payload.get(args.payload_key, ""),
+                         "keyword_id": pt.id, "score": round(pt.score, 6)}
                         for pt in points
                     ],
                 }
@@ -288,8 +288,8 @@ async def bench_original_pipeline(products: list[str], args):
                 doc = {
                     "product_name": product,
                     "keywords": [
-                        {"keyword": pt.payload["keyword"], "keyword_id": pt.id,
-                         "score": round(pt.score, 6)}
+                        {"keyword": pt.payload.get(args.payload_key, ""),
+                         "keyword_id": pt.id, "score": round(pt.score, 6)}
                         for pt in all_matches[i]
                     ],
                 }
@@ -360,7 +360,7 @@ async def bench_scaling(products: list[str], args):
                         "_source": {
                             "product_name": product,
                             "keywords": [
-                                {"keyword": pt.payload["keyword"],
+                                {"keyword": pt.payload.get(args.payload_key, ""),
                                  "keyword_id": pt.id, "score": round(pt.score, 6)}
                                 for pt in pts
                             ],
@@ -448,6 +448,8 @@ def main():
     parser.add_argument("--es_url", default="http://localhost:9200")
     parser.add_argument("--model", default="ruri_v3")
     parser.add_argument("--collection", default="keywords")
+    parser.add_argument("--payload_key", default="keyword",
+                        help="Qdrant payload 필드 이름 (default: keyword)")
     args = parser.parse_args()
 
     print("=" * 60)

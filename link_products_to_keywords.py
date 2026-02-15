@@ -155,6 +155,7 @@ async def _process_batch(
     max_retries: int,
     retry_delay: float,
     failure_logger: AsyncFailureLogger,
+    payload_key: str = "keyword",
 ):
     """
     1. embed(products) via executor → 2. qdrant.search_batch() async → 3. async_bulk to ES
@@ -184,7 +185,7 @@ async def _process_batch(
                         "product_name": product,
                         "keywords": [
                             {
-                                "keyword": pt.payload["keyword"],
+                                "keyword": pt.payload.get(payload_key, ""),
                                 "keyword_id": pt.id,
                                 "score": round(pt.score, 6),
                             }
@@ -336,6 +337,7 @@ async def _run(args):
             bid, batch, embedder, qdrant, es,
             args.top_k, semaphore, stats,
             args.max_retries, args.retry_delay, failure_logger,
+            payload_key=args.payload_key,
         )
         for bid, batch in batches
     ])
@@ -410,6 +412,8 @@ def main():
     parser.add_argument("--model", default="ruri_v3")
     parser.add_argument("--collection", default="keywords")
     parser.add_argument("--index", default="product_keywords")
+    parser.add_argument("--payload_key", default="keyword",
+                        help="Qdrant payload 필드 이름 (default: keyword)")
 
     parser.add_argument(
         "--mode", choices=["bulk", "realtime"], default="bulk",
