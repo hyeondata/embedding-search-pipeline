@@ -7,7 +7,7 @@ Product-Keyword Linking Pipeline — 병목 분석 + 최적화 벤치마크
 
 최적화:
   1. Qdrant batch query — 64건 순차 → 1회 배치 HTTP 호출
-  2. Async Qdrant client — sync → async (이벤트 루프 직접)
+  2. AsyncQdrantIndexer — sync → async (이벤트 루프 직접)
   3. 배치 크기 / 워커 수 최적 탐색
 
 사용:
@@ -18,17 +18,13 @@ Product-Keyword Linking Pipeline — 병목 분석 + 최적화 벤치마크
 import argparse
 import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import numpy as np
 from elasticsearch.helpers import async_bulk
-from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import QueryRequest
 
 from es_indexer import ESIndexer
 from kserve_embed_client import EmbeddingClient, RURI_QUERY_PREFIX
-from qdrant_indexer import QdrantIndexer
+from qdrant_indexer import AsyncQdrantIndexer, QdrantIndexer
 
 QUERY_PREFIX = RURI_QUERY_PREFIX
 
@@ -87,42 +83,35 @@ async def bench_stages(products: list[str], args):
     print(f"\n  [B-1] Qdrant 순차 검색 ({n}건 × top-{args.top_k})")
     print(f"        {search_seq_ms:.0f}ms → {search_seq_rps:,.0f} queries/sec")
 
-    # ── Stage B-2: Qdrant 배치 검색 (최적화) ──
-    sync_client = QdrantClient(url=args.qdrant_url)
-    batch_requests = [
-        QueryRequest(query=emb.tolist(), limit=args.top_k, with_payload=True)
-        for emb in embeddings
-    ]
+    # ── Stage B-2: Qdrant Sync 배치 검색 (최적화) ──
     t0 = time.perf_counter()
-    results_batch = sync_client.query_batch_points(
-        collection_name=args.collection, requests=batch_requests
-    )
+    vectors = [emb.tolist() for emb in embeddings]
+    results_batch_resp = qdrant.search_batch(vectors, args.top_k)
     search_batch_ms = (time.perf_counter() - t0) * 1000
     search_batch_rps = n / (search_batch_ms / 1000)
     speedup = search_seq_ms / search_batch_ms if search_batch_ms > 0 else 0
-    print(f"\n  [B-2] Qdrant 배치 검색 ({n}건 × top-{args.top_k}, 1회 HTTP)")
+    print(f"\n  [B-2] Qdrant Sync 배치 검색 ({n}건 × top-{args.top_k}, 1회 HTTP)")
     print(f"        {search_batch_ms:.0f}ms → {search_batch_rps:,.0f} queries/sec")
     print(f"        순차 대비 {speedup:.1f}x 빠름")
 
-    # ── Stage B-3: Qdrant 비동기 배치 검색 ──
-    async_qdrant = AsyncQdrantClient(url=args.qdrant_url)
+    # ── Stage B-3: AsyncQdrantIndexer 배치 검색 ──
+    async_indexer = AsyncQdrantIndexer(args.qdrant_url, args.collection, 768)
     t0 = time.perf_counter()
-    results_async = await async_qdrant.query_batch_points(
-        collection_name=args.collection, requests=batch_requests
-    )
+    results_async_resp = await async_indexer.search_batch(vectors, args.top_k)
     search_async_ms = (time.perf_counter() - t0) * 1000
     search_async_rps = n / (search_async_ms / 1000)
-    print(f"\n  [B-3] Qdrant Async 배치 검색 ({n}건 × top-{args.top_k})")
+    print(f"\n  [B-3] AsyncQdrantIndexer 배치 검색 ({n}건 × top-{args.top_k})")
     print(f"        {search_async_ms:.0f}ms → {search_async_rps:,.0f} queries/sec")
-    await async_qdrant.close()
+    await async_indexer.close()
 
     # ── Stage C: ES Bulk Indexing ──
     es = ESIndexer(args.es_url, "bench_pipeline_test")
     await es.create_index(PRODUCT_KEYWORDS_SCHEMA)
 
+    # results_batch_resp에서 결과 추출
     actions = []
     for i, product in enumerate(products):
-        points = results_batch[i].points
+        points = results_batch_resp[i].points
         doc = {
             "product_name": product,
             "keywords": [
@@ -150,7 +139,7 @@ async def bench_stages(products: list[str], args):
     for label, ms, rps in [
         ("KServe Embedding", embed_ms, embed_rps),
         ("Qdrant 순차 검색", search_seq_ms, search_seq_rps),
-        ("Qdrant 배치 검색 (최적화)", search_batch_ms, search_batch_rps),
+        ("Qdrant Sync 배치 (최적화)", search_batch_ms, search_batch_rps),
         ("Qdrant Async 배치 (최적화)", search_async_ms, search_async_rps),
         ("ES Bulk Indexing", es_ms, es_rps),
     ]:
@@ -171,18 +160,17 @@ async def bench_stages(products: list[str], args):
 # Phase 2: 최적화된 파이프라인 E2E 벤치마크
 # ============================================================
 async def bench_optimized_pipeline(products: list[str], args):
-    """최적화 적용 후 E2E 처리량 측정"""
+    """최적화 적용 후 E2E 처리량 측정 — AsyncQdrantIndexer 사용"""
     print("\n" + "=" * 60)
     print("  Phase 2: 최적화 파이프라인 E2E")
     print("=" * 60)
 
     n = len(products)
     embedder = EmbeddingClient(args.kserve_url, args.model)
-    async_qdrant = AsyncQdrantClient(url=args.qdrant_url)
+    async_indexer = AsyncQdrantIndexer(args.qdrant_url, args.collection, 768)
     es = ESIndexer(args.es_url, "bench_pipeline_opt")
     await es.create_index(PRODUCT_KEYWORDS_SCHEMA)
 
-    executor = ThreadPoolExecutor(max_workers=args.workers)
     semaphore = asyncio.Semaphore(args.workers)
 
     processed = 0
@@ -193,23 +181,18 @@ async def bench_optimized_pipeline(products: list[str], args):
     async def process_batch_optimized(batch_products: list[str]):
         nonlocal processed, total_embed_ms, total_search_ms, total_es_ms
         async with semaphore:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
-            # Step 1: Embed (sync → thread)
+            # Step 1: Embed (sync → default executor)
             prefixed = [QUERY_PREFIX + p for p in batch_products]
             t0 = time.perf_counter()
-            embeddings = await loop.run_in_executor(executor, embedder.embed, prefixed)
+            embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
             embed_ms = (time.perf_counter() - t0) * 1000
 
-            # Step 2: Qdrant batch query (async — 이벤트 루프 직접)
-            batch_requests = [
-                QueryRequest(query=emb.tolist(), limit=args.top_k, with_payload=True)
-                for emb in embeddings
-            ]
+            # Step 2: Qdrant async 배치 검색
+            vectors = [emb.tolist() for emb in embeddings]
             t1 = time.perf_counter()
-            results = await async_qdrant.query_batch_points(
-                collection_name=args.collection, requests=batch_requests
-            )
+            results = await async_indexer.search_batch(vectors, args.top_k)
             search_ms = (time.perf_counter() - t1) * 1000
 
             # Step 3: ES bulk (async)
@@ -253,8 +236,7 @@ async def bench_optimized_pipeline(products: list[str], args):
     await es.finalize()
     count = await es.count()
     await es.close()
-    await async_qdrant.close()
-    executor.shutdown(wait=False)
+    await async_indexer.close()
 
     print(f"\n  결과:")
     print(f"    Wall time:   {wall_sec:.2f}초")
@@ -271,7 +253,7 @@ async def bench_optimized_pipeline(products: list[str], args):
 # Phase 3: 기존 파이프라인 E2E (비교용)
 # ============================================================
 async def bench_original_pipeline(products: list[str], args):
-    """기존(비최적화) 파이프라인 E2E"""
+    """기존(비최적화) 파이프라인 E2E — 순차 검색 + sync QdrantIndexer"""
     print("\n" + "=" * 60)
     print("  Phase 3: 기존 파이프라인 E2E (비교 기준)")
     print("=" * 60)
@@ -282,14 +264,13 @@ async def bench_original_pipeline(products: list[str], args):
     es = ESIndexer(args.es_url, "bench_pipeline_orig")
     await es.create_index(PRODUCT_KEYWORDS_SCHEMA)
 
-    executor = ThreadPoolExecutor(max_workers=args.workers)
     semaphore = asyncio.Semaphore(args.workers)
     processed = 0
 
     async def process_batch_original(batch_products: list[str]):
         nonlocal processed
         async with semaphore:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def embed_and_search():
                 prefixed = [QUERY_PREFIX + p for p in batch_products]
@@ -300,7 +281,7 @@ async def bench_original_pipeline(products: list[str], args):
                     matches.append(resp.points)
                 return matches
 
-            all_matches = await loop.run_in_executor(executor, embed_and_search)
+            all_matches = await loop.run_in_executor(None, embed_and_search)
 
             actions = []
             for i, product in enumerate(batch_products):
@@ -334,7 +315,6 @@ async def bench_original_pipeline(products: list[str], args):
     await es.finalize()
     count = await es.count()
     await es.close()
-    executor.shutdown(wait=False)
 
     print(f"\n  결과:")
     print(f"    Wall time: {wall_sec:.2f}초")
@@ -348,7 +328,7 @@ async def bench_original_pipeline(products: list[str], args):
 # Phase 4: 워커 수별 스케일링 테스트
 # ============================================================
 async def bench_scaling(products: list[str], args):
-    """workers 수별 처리량 비교"""
+    """workers 수별 처리량 비교 — AsyncQdrantIndexer 사용"""
     print("\n" + "=" * 60)
     print("  Phase 4: 워커 수별 스케일링 (최적화 파이프라인)")
     print("=" * 60)
@@ -358,23 +338,20 @@ async def bench_scaling(products: list[str], args):
     results = []
 
     for workers in [1, 2, 4, 8]:
-        async_qdrant = AsyncQdrantClient(url=args.qdrant_url)
+        async_indexer = AsyncQdrantIndexer(args.qdrant_url, args.collection, 768)
         es = ESIndexer(args.es_url, f"bench_scale_{workers}w")
         await es.create_index(PRODUCT_KEYWORDS_SCHEMA)
 
-        executor = ThreadPoolExecutor(max_workers=workers)
         semaphore = asyncio.Semaphore(workers)
 
-        async def process(batch_products, _sem=semaphore, _exec=executor,
-                          _aq=async_qdrant, _es=es):
+        async def process(batch_products, _sem=semaphore,
+                          _ai=async_indexer, _es=es):
             async with _sem:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 prefixed = [QUERY_PREFIX + p for p in batch_products]
-                embeddings = await loop.run_in_executor(_exec, embedder.embed, prefixed)
-                reqs = [QueryRequest(query=e.tolist(), limit=args.top_k, with_payload=True) for e in embeddings]
-                qdrant_results = await _aq.query_batch_points(
-                    collection_name=args.collection, requests=reqs
-                )
+                embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
+                vectors = [e.tolist() for e in embeddings]
+                qdrant_results = await _ai.search_batch(vectors, args.top_k)
                 actions = []
                 for i, product in enumerate(batch_products):
                     pts = qdrant_results[i].points
@@ -400,8 +377,7 @@ async def bench_scaling(products: list[str], args):
 
         await es.finalize()
         await es.close()
-        await async_qdrant.close()
-        executor.shutdown(wait=False)
+        await async_indexer.close()
 
         results.append((workers, wall, rps))
         print(f"  workers={workers:>2}  {wall:.2f}s  {rps:>6,.0f} products/sec")

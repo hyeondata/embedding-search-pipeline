@@ -38,7 +38,6 @@ import argparse
 import asyncio
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from elasticsearch.helpers import async_bulk
@@ -52,7 +51,7 @@ from kserve_embed_client import (
     batch_iter,
     timer,
 )
-from qdrant_indexer import QdrantIndexer
+from qdrant_indexer import AsyncQdrantIndexer
 
 QUERY_PREFIX = RURI_QUERY_PREFIX
 
@@ -106,7 +105,7 @@ class _Stats:
         self._interval_start = time.perf_counter()
         self._interval_count = 0
 
-    def update(self, count: int, sync_ms: float, es_ms: float):
+    def update(self, count: int, embed_ms: float, search_ms: float, es_ms: float):
         self.processed += count
         self._interval_count += count
         n = self.processed
@@ -123,7 +122,7 @@ class _Stats:
             pct = n / self.total * 100
             msg = (
                 f"[{pct:5.1f}%] {n:>7,}/{self.total:,}  "
-                f"embed+search={sync_ms:.0f}ms  es={es_ms:.0f}ms  "
+                f"embed={embed_ms:.0f}ms  search={search_ms:.0f}ms  es={es_ms:.0f}ms  "
                 f"avg={avg_rps:,.0f} p/s  interval={interval_rps:,.0f} p/s"
             )
             print(f"         {msg}")
@@ -148,10 +147,9 @@ async def _process_batch(
     batch_idx: int,
     products: list[str],
     embedder: EmbeddingClient,
-    qdrant: QdrantIndexer,
+    qdrant: AsyncQdrantIndexer,
     es_indexer: ESIndexer,
     top_k: int,
-    executor: ThreadPoolExecutor,
     semaphore: asyncio.Semaphore,
     stats: _Stats,
     max_retries: int,
@@ -159,25 +157,25 @@ async def _process_batch(
     failure_logger: AsyncFailureLogger,
 ):
     """
-    1. embed(products) → 2. qdrant.search_batch() → 3. async_bulk to ES
+    1. embed(products) via executor → 2. qdrant.search_batch() async → 3. async_bulk to ES
     실패 시 지수 백오프 재시도, 최종 실패 시 실패 로깅.
     """
     async with semaphore:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         last_error: Exception | None = None
 
         for attempt in range(1, max_retries + 2):  # 1 = 최초, 2~N+1 = 재시도
             try:
-                # Step 1+2: 임베딩 + Qdrant 배치 검색 (sync → thread)
-                def embed_and_search():
-                    prefixed = [QUERY_PREFIX + p for p in products]
-                    embeddings = embedder.embed(prefixed)
-                    vectors = [emb.tolist() for emb in embeddings]
-                    batch_results = qdrant.search_batch(vectors, top_k)
-                    return [resp.points for resp in batch_results]
+                # Step 1: 임베딩 (sync → default executor)
+                prefixed = [QUERY_PREFIX + p for p in products]
+                with timer() as t_embed:
+                    embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
 
-                with timer() as t_sync:
-                    all_matches = await loop.run_in_executor(executor, embed_and_search)
+                # Step 2: Qdrant 비동기 배치 검색
+                vectors = [emb.tolist() for emb in embeddings]
+                with timer() as t_search:
+                    batch_results = await qdrant.search_batch(vectors, top_k)
+                all_matches = [resp.points for resp in batch_results]
 
                 # Step 3: ES bulk 인덱싱 (async)
                 actions = []
@@ -207,7 +205,7 @@ async def _process_batch(
                 if errors:
                     logger.warning(f"Batch {batch_idx}: {len(errors)} ES bulk errors")
 
-                stats.update(len(products), t_sync.ms, t_es.ms)
+                stats.update(len(products), t_embed.ms, t_search.ms, t_es.ms)
                 return  # 성공
 
             except Exception as e:
@@ -283,7 +281,7 @@ async def _run(args):
     # [2/5] 클라이언트 초기화
     print("\n  [2/5] 클라이언트 초기화")
     embedder = EmbeddingClient(args.kserve_url, args.model)
-    qdrant = QdrantIndexer(args.qdrant_url, args.collection, 768)
+    qdrant = AsyncQdrantIndexer(args.qdrant_url, args.collection, 768)
 
     es_config = ESConfig(
         es_url=args.es_url,
@@ -296,7 +294,7 @@ async def _run(args):
     )
     es = ESIndexer.from_config(es_config)
 
-    qdrant_count = qdrant.count
+    qdrant_count = await qdrant.get_count()
     es_display = args.es_nodes[0] if args.es_nodes else args.es_url
     node_info = f" (+{len(args.es_nodes)-1} nodes)" if args.es_nodes and len(args.es_nodes) > 1 else ""
     print(f"         KServe: {args.kserve_url}/v2/models/{args.model}")
@@ -323,7 +321,6 @@ async def _run(args):
         f"retries={args.max_retries})"
     )
     stats = _Stats(total)
-    executor = ThreadPoolExecutor(max_workers=args.workers)
     semaphore = asyncio.Semaphore(args.workers)
 
     # 실패 로그 경로 결정
@@ -337,7 +334,7 @@ async def _run(args):
     await asyncio.gather(*[
         _process_batch(
             bid, batch, embedder, qdrant, es,
-            args.top_k, executor, semaphore, stats,
+            args.top_k, semaphore, stats,
             args.max_retries, args.retry_delay, failure_logger,
         )
         for bid, batch in batches
@@ -382,8 +379,8 @@ async def _run(args):
         if len(doc["keywords"]) > 5:
             print(f"    ... 외 {len(doc['keywords']) - 5}건")
 
+    await qdrant.close()
     await es.close()
-    executor.shutdown(wait=False)
     print("\n  완료!")
     logger.info("완료")
 
