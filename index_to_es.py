@@ -84,11 +84,11 @@ def main():
         help="배치 실패 시 최대 재시도 횟수 (0=재시도 없음, default: 3)",
     )
     retry.add_argument(
-        "--retry_delay", type=float, default=1.0,
+        "--retry_backoff", type=float, default=1.0,
         help="첫 재시도 대기 시간 (초, 이후 ×2 지수 백오프, default: 1.0)",
     )
     retry.add_argument(
-        "--dead_letter_path", type=Path, default=None,
+        "--failure_log", type=Path, default=None,
         help="실패 문서 JSONL 파일 경로 (미지정 시 logs/ 에 자동 생성)",
     )
 
@@ -98,26 +98,29 @@ def main():
     if args.schema:
         schema = json.loads(args.schema.read_text(encoding="utf-8"))
 
-    config = Config(
-        keywords_path=args.keywords,
-        parquet_path=args.parquet,
-        parquet_chunk_size=args.parquet_chunk_size,
-        parquet_text_column=args.parquet_column,
-        limit=args.limit,
-        batch_size=args.batch_size,
-        workers=args.workers,
-        index_name=args.index,
-        es_url=args.es_url,
-        es_nodes=args.es_nodes,
-        es_fingerprint=args.es_fingerprint,
-        es_username=args.es_username,
-        es_password=args.es_password,
-        es_api_key=args.es_api_key,
-        schema=schema,
-        max_retries=args.max_retries,
-        retry_delay=args.retry_delay,
-        dead_letter_path=args.dead_letter_path,
-    )
+    config_kwargs = {
+        "keywords_path": args.keywords,
+        "parquet_path": args.parquet,
+        "parquet_chunk_size": args.parquet_chunk_size,
+        "parquet_text_column": args.parquet_column,
+        "limit": args.limit,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "index_name": args.index,
+        "es_url": args.es_url,
+        "es_nodes": args.es_nodes,
+        "es_fingerprint": args.es_fingerprint,
+        "es_username": args.es_username,
+        "es_password": args.es_password,
+        "es_api_key": args.es_api_key,
+        "schema": schema,
+        "max_retries": args.max_retries,
+        "retry_backoff": args.retry_backoff,
+    }
+    if args.failure_log:
+        config_kwargs["failure_log_path"] = args.failure_log
+
+    config = Config(**config_kwargs)
 
     if args.mode == "bulk":
         run_indexing(config)
