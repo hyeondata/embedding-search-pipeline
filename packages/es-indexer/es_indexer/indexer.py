@@ -32,7 +32,6 @@ def build_es_client(config: Config) -> AsyncElasticsearch:
     hosts = config.es_nodes or [config.es_url]
     is_cluster = config.es_nodes is not None
 
-    # 클러스터 모드: fingerprint 필수 + 인증 필수
     if is_cluster:
         if not config.es_fingerprint:
             raise ValueError(
@@ -49,16 +48,14 @@ def build_es_client(config: Config) -> AsyncElasticsearch:
 
     kwargs: dict = {"hosts": hosts}
 
-    # 인증: API Key 우선, 없으면 Basic Auth
     if config.es_api_key:
         kwargs["api_key"] = config.es_api_key
     elif config.es_username and config.es_password:
         kwargs["basic_auth"] = (config.es_username, config.es_password)
 
-    # TLS: fingerprint 적용
     if config.es_fingerprint:
         kwargs["ssl_assert_fingerprint"] = config.es_fingerprint
-        kwargs["verify_certs"] = False  # fingerprint가 CA 체인 검증을 대체
+        kwargs["verify_certs"] = False
 
     return AsyncElasticsearch(**kwargs)
 
@@ -78,11 +75,7 @@ class ESIndexer:
 
     @classmethod
     def from_config(cls, config: Config, index_name: str | None = None) -> ESIndexer:
-        """Config 객체로 클러스터 연결이 포함된 ESIndexer 생성.
-
-        기존 __init__(es_url, index_name)과 하위 호환을 유지하면서
-        fingerprint, basic_auth, 다중 노드 등을 지원.
-        """
+        """Config 객체로 클러스터 연결이 포함된 ESIndexer 생성."""
         instance = cls.__new__(cls)
         instance.es = build_es_client(config)
         instance.index_name = index_name or config.index_name
@@ -115,7 +108,6 @@ class ESIndexer:
     async def ensure_index(self, schema: dict | None = None) -> bool:
         """
         인덱스가 없을 때만 생성 (기존 데이터 보존).
-        벌크 최적화 설정을 적용하지 않음 — 실시간 모드용.
 
         Returns: True면 새로 생성됨, False면 이미 존재.
         """
@@ -131,7 +123,7 @@ class ESIndexer:
         return True
 
     # ================================================================
-    # Bulk 인덱싱 — Bulk / Realtime 공통
+    # Bulk 인덱싱
     # ================================================================
 
     async def bulk_index(self, start_id: int, keywords: list[str]):
@@ -166,11 +158,11 @@ class ESIndexer:
         )
 
     # ================================================================
-    # Realtime CRUD — 단건 조작
+    # Realtime CRUD
     # ================================================================
 
     async def index(self, doc_id: str, keyword: str, refresh: bool = True):
-        """단일 문서 인덱싱 (upsert). refresh=True면 즉시 검색 가능."""
+        """단일 문서 인덱싱 (upsert)."""
         await self.es.index(
             index=self.index_name,
             id=doc_id,
@@ -179,7 +171,7 @@ class ESIndexer:
         )
 
     async def update(self, doc_id: str, fields: dict, refresh: bool = True):
-        """문서 부분 업데이트. fields의 키-값만 변경."""
+        """문서 부분 업데이트."""
         await self.es.update(
             index=self.index_name,
             id=doc_id,
@@ -227,7 +219,7 @@ class ESIndexer:
         return result["count"]
 
     async def refresh(self):
-        """수동 리프레시 — 모든 pending 문서를 검색 가능하게"""
+        """수동 리프레시"""
         await self.es.indices.refresh(index=self.index_name)
 
     async def close(self):

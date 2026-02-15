@@ -7,23 +7,20 @@
   - logger.info() 한 번 호출로 양쪽에 동시 출력
 
 사용법:
-    from .log import setup_logging, get_logger
+    from kserve_embed_client.log import setup_logging, get_logger
 
-    logger = get_logger("pipeline")     # qdrant_indexer.pipeline
-    setup_logging(log_file=Path("x.log"))
+    logger = get_logger("qdrant_indexer", "pipeline")
+    setup_logging("qdrant_indexer", log_file=Path("x.log"))
     logger.info("[bold green]완료![/bold green]")
-    # Console: 초록색 볼드로 "완료!" 출력
-    # File:    "2026-02-09 15:30:45  qdrant_indexer.pipeline  완료!" (plain text)
 """
 
 import logging
-import re
 from pathlib import Path
 
 from rich.logging import RichHandler
 from rich.text import Text
 
-PKG = "qdrant_indexer"
+DEFAULT_PKG = "kserve_embed_client"
 
 
 class _PlainFormatter(logging.Formatter):
@@ -35,18 +32,18 @@ class _PlainFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        # Rich markup 제거 (원본 record 보존을 위해 복사)
         original_msg = record.msg
         try:
             record.msg = Text.from_markup(str(record.msg)).plain
         except Exception:
-            pass  # markup 파싱 실패 시 원본 유지
+            pass
         result = super().format(record)
         record.msg = original_msg
         return result
 
 
 def setup_logging(
+    pkg_name: str = DEFAULT_PKG,
     log_file: Path = None,
     level: int = logging.INFO,
 ) -> logging.Logger:
@@ -57,13 +54,14 @@ def setup_logging(
     - FileHandler: log_file 인자가 있을 때마다 추가 (파일 로그)
 
     Args:
+        pkg_name: 패키지 이름 (로거 이름)
         log_file: 로그 파일 경로 (None이면 콘솔만)
         level:    로그 레벨 (기본: INFO)
 
     Returns:
         패키지 루트 로거
     """
-    logger = logging.getLogger(PKG)
+    logger = logging.getLogger(pkg_name)
     logger.setLevel(level)
 
     # RichHandler는 1회만 추가
@@ -89,11 +87,22 @@ def setup_logging(
     return logger
 
 
-def get_logger(name: str) -> logging.Logger:
+def get_logger(pkg_name: str, name: str = None) -> logging.Logger:
     """
     패키지 하위 로거 반환.
 
-    예: get_logger("pipeline") → logging.getLogger("qdrant_indexer.pipeline")
-    하위 로거는 PKG 로거의 핸들러를 자동 상속 (propagate=True).
+    예: get_logger("qdrant_indexer", "pipeline")
+        → logging.getLogger("qdrant_indexer.pipeline")
+
+    name을 생략하면 패키지 루트 로거를 반환.
+
+    Args:
+        pkg_name: 패키지 이름
+        name:     모듈 이름 (선택)
+
+    Returns:
+        logging.Logger
     """
-    return logging.getLogger(f"{PKG}.{name}")
+    if name:
+        return logging.getLogger(f"{pkg_name}.{name}")
+    return logging.getLogger(pkg_name)

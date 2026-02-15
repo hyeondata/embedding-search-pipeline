@@ -17,7 +17,7 @@ class Config:
     parquet_chunk_size: int = 10000   # Parquet 청크 크기 (행 수)
     parquet_text_column: str = "keyword"  # 텍스트가 들어있는 컬럼명
 
-    # KServe
+    # KServe 임베딩
     kserve_url: str = "http://localhost:8080"
     model_name: str = "ruri_v3"
 
@@ -34,7 +34,7 @@ class Config:
     max_retries: int = 3              # 배치당 최대 재시도 횟수
     retry_backoff: float = 1.0        # 초기 대기 시간 (초)
     retry_exponential: bool = True    # 지수 백오프 사용 (1s → 2s → 4s → ...)
-    retry_max_backoff: float = 60.0  # 최대 대기 시간 (초)
+    retry_max_backoff: float = 60.0   # 최대 대기 시간 (초)
 
     # 실패 로깅
     log_failures: bool = True         # 실패한 배치를 파일에 기록

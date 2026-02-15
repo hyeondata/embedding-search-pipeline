@@ -45,7 +45,8 @@ from pathlib import Path
 from elasticsearch.helpers import async_bulk
 
 from es_indexer import Config as ESConfig, ESIndexer
-from qdrant_indexer import EmbeddingClient, ParquetReader, QdrantIndexer
+from kserve_embed_client import EmbeddingClient, ParquetReader
+from qdrant_indexer import QdrantIndexer
 
 # ── ruri-v3 비대칭 검색 프리픽스 ──
 QUERY_PREFIX = "検索クエリ: "

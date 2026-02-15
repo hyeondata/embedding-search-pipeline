@@ -5,14 +5,21 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .config import Config
-from .embedder import EmbeddingClient
-from .indexer import QdrantIndexer
-from .log import get_logger, setup_logging
-from .parquet_reader import ParquetReader
-from .retry import FailureLogger, RetryConfig, with_retry
+from kserve_embed_client import (
+    EmbeddingClient,
+    FailureLogger,
+    ParquetReader,
+    RetryConfig,
+    get_logger,
+    setup_logging,
+    with_retry,
+)
 
-logger = get_logger("pipeline")
+from .config import Config
+from .indexer import QdrantIndexer
+
+_PKG = "qdrant_indexer"
+logger = get_logger(_PKG, "pipeline")
 
 
 # ============================================================
@@ -125,7 +132,7 @@ def run_indexing(config: Config, log_path: Path = None):
         )
     log_path.mkdir(parents=True, exist_ok=True)
     log_file = log_path / f"indexing_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    setup_logging(log_file=log_file)
+    setup_logging(_PKG, log_file=log_file)
 
     logger.info(f"Log: {log_file}")
     logger.info(f"config: {config}")
@@ -134,7 +141,6 @@ def run_indexing(config: Config, log_path: Path = None):
     logger.info("[bold]\\[1/4] 데이터 로드[/bold]")
 
     if config.parquet_path:
-        # Parquet 파일 읽기
         reader = ParquetReader(
             config.parquet_path,
             chunk_size=config.parquet_chunk_size,
@@ -149,7 +155,6 @@ def run_indexing(config: Config, log_path: Path = None):
         data_source = "parquet"
 
     else:
-        # 텍스트 파일 읽기 (기존 방식)
         keywords = config.keywords_path.read_text(encoding="utf-8").strip().split("\n")
         if config.limit > 0:
             keywords = keywords[: config.limit]
@@ -187,31 +192,25 @@ def run_indexing(config: Config, log_path: Path = None):
     embedder = EmbeddingClient(config.kserve_url, config.model_name)
     stats = _Stats(total)
 
-    # 재시도 데코레이터가 적용된 배치 처리 함수 생성
     process_batch = _create_batch_processor(embedder, indexer, stats, failure_logger, retry_config)
 
     if data_source == "parquet":
-        # Parquet: 청크 스트리밍 + 배치 분할
         with ThreadPoolExecutor(max_workers=config.workers) as pool:
             futures = []
 
             for chunk_id, chunk_keywords in reader.iter_chunks():
-                # 각 청크를 batch_size 단위로 분할
                 for i in range(0, len(chunk_keywords), config.batch_size):
                     batch = chunk_keywords[i : i + config.batch_size]
                     batch_id = chunk_id * config.parquet_chunk_size + i
                     futures.append(pool.submit(process_batch, batch_id, batch))
 
-            # 모든 Future 완료 대기
             for future in as_completed(futures):
                 try:
                     future.result()
                 except Exception as e:
                     logger.error(f"[bold red]배치 처리 실패 (최종)[/bold red]: {e}")
-                    # 재시도가 모두 실패한 경우 계속 진행 (다른 배치 처리)
 
     else:
-        # 텍스트 파일: 기존 방식
         batches = [
             (i, keywords[i : i + config.batch_size])
             for i in range(0, total, config.batch_size)

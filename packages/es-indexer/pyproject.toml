@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "es-indexer"
+version = "0.1.0"
+description = "Elasticsearch bulk and realtime indexing pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "kserve-embed-client>=0.1.0",
+    "elasticsearch>=8.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "pytest-asyncio",
+]
+
+[tool.uv.sources]
+kserve-embed-client = { workspace = true }

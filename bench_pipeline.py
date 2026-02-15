@@ -27,7 +27,8 @@ from qdrant_client import AsyncQdrantClient, QdrantClient
 from qdrant_client.models import QueryRequest
 
 from es_indexer import ESIndexer
-from qdrant_indexer import EmbeddingClient, QdrantIndexer
+from kserve_embed_client import EmbeddingClient
+from qdrant_indexer import QdrantIndexer
 
 QUERY_PREFIX = "検索クエリ: "
 

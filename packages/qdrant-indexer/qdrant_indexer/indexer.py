@@ -66,9 +66,6 @@ class QdrantIndexer:
         """
         여러 쿼리 벡터를 한 번의 API 호출로 검색 (query_batch_points).
 
-        기존: N번 query_points → N번 HTTP round-trip
-        개선: 1번 query_batch_points → 1번 HTTP round-trip
-
         Args:
             query_vectors: 쿼리 벡터 리스트 (각 768-dim)
             top_k: 각 쿼리당 반환 결과 수

@@ -1,0 +1,33 @@
+[project]
+name = "embedding-search-pipeline"
+version = "0.1.0"
+description = "Monorepo: KServe embedding + Qdrant/Elasticsearch indexing pipelines"
+requires-python = ">=3.10"
+dependencies = [
+    "kserve-embed-client",
+    "qdrant-indexer",
+    "es-indexer",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "pytest-asyncio",
+]
+
+[tool.uv.sources]
+kserve-embed-client = { workspace = true }
+qdrant-indexer = { workspace = true }
+es-indexer = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "packages/kserve-embed-client",
+    "packages/qdrant-indexer",
+    "packages/es-indexer",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -6,12 +6,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Config
-from .embedder import EmbeddingClient
-from .indexer import AsyncQdrantIndexer, QdrantIndexer
-from .log import get_logger, setup_logging
+from kserve_embed_client import EmbeddingClient, get_logger, setup_logging
 
-logger = get_logger("searcher")
+from .config import Config
+from .indexer import AsyncQdrantIndexer, QdrantIndexer
+
+_PKG = "qdrant_indexer"
+logger = get_logger(_PKG, "searcher")
 
 
 @dataclass
@@ -94,7 +95,6 @@ class Searcher:
 
         embeddings = self.embedder.embed(prefixed)
 
-        # query_batch_points: N번 HTTP → 1번 HTTP
         vectors = [embeddings[i].tolist() for i in range(len(queries))]
         responses = self.indexer.search_batch(vectors, top_k=top_k)
 
@@ -176,18 +176,15 @@ async def _async_search_batch(
     """단일 배치: 임베딩 → query_batch_points(1회) → JSONL 기록"""
     prefixed = [f"{prefix}{q}" for q in queries]
 
-    # 임베딩 (sync HTTP → run_in_executor로 비동기화)
     t0 = time.perf_counter()
     embeddings = await loop.run_in_executor(None, embedder.embed, prefixed)
     embed_ms = (time.perf_counter() - t0) * 1000
 
-    # query_batch_points: N개 쿼리를 1번의 API 호출로
     t0 = time.perf_counter()
     vectors = [embeddings[i].tolist() for i in range(len(queries))]
     responses = await async_indexer.search_batch(vectors, top_k=top_k)
     search_ms = (time.perf_counter() - t0) * 1000
 
-    # JSONL 기록
     lines = []
     for idx, query in enumerate(queries):
         record = {
@@ -204,7 +201,6 @@ async def _async_search_batch(
         }
         lines.append(json.dumps(record, ensure_ascii=False))
 
-    # 파일 쓰기 (한번에 모아서)
     out_file.write("\n".join(lines) + "\n")
 
     stats.update(len(queries), embed_ms, search_ms)
@@ -222,7 +218,6 @@ async def _run_async_batch_search(
     async_indexer = AsyncQdrantIndexer(config.qdrant_url, config.collection_name, config.vector_dim)
     loop = asyncio.get_event_loop()
 
-    # Semaphore로 동시 실행 배치 수 제한 (workers)
     sem = asyncio.Semaphore(config.workers)
 
     batches = [
@@ -238,7 +233,6 @@ async def _run_async_batch_search(
                     Searcher.QUERY_PREFIX, stats, out_file, loop,
                 )
 
-        # 모든 배치를 동시에 스케줄링 (Semaphore가 동시 실행 수를 제한)
         await asyncio.gather(*[bounded_search(batch) for batch in batches])
 
     await async_indexer.close()
@@ -258,19 +252,6 @@ def run_batch_search(
       2. asyncio로 동시 embed + query_batch_points
       3. 결과를 JSONL 파일로 저장
       4. 통계 출력
-
-    성능 개선:
-      - query_batch_points: 배치 N개 쿼리를 1번 HTTP 호출 (기존 N번 → 1번)
-      - AsyncQdrantClient: asyncio 네이티브 I/O 다중화 (ThreadPool 오버헤드 제거)
-      - Semaphore: 동시 실행 배치 수를 workers로 제한
-
-    Args:
-        config:       Config 인스턴스 (kserve_url, qdrant_url, batch_size, workers)
-        queries_path: 쿼리 파일 경로 (한 줄에 쿼리 1개)
-        output_path:  결과 JSONL 파일 (기본: logs/search_results_YYYYMMDD_HHMMSS.jsonl)
-        top_k:        각 쿼리당 반환 결과 수
-        limit:        처리할 쿼리 수 (0=전체)
-        log_path:     로그 디렉토리
     """
     # 로그 설정
     if log_path is None:
@@ -279,7 +260,7 @@ def run_batch_search(
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     log_file = log_path / f"batch_search_{ts}.log"
-    setup_logging(log_file=log_file)
+    setup_logging(_PKG, log_file=log_file)
 
     if output_path is None:
         output_path = log_path / f"search_results_{ts}.jsonl"
@@ -309,7 +290,6 @@ def run_batch_search(
 
     stats = _SearchStats(total)
 
-    # asyncio 이벤트 루프 실행
     asyncio.run(_run_async_batch_search(config, queries, top_k, output_path, stats))
 
     wall = stats.wall_sec

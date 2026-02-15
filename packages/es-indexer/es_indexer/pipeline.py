@@ -35,9 +35,9 @@ from rich.table import Table
 from .config import Config
 from .indexer import ESIndexer
 
-# qdrant_indexer에서 ParquetReader 가져오기
+# kserve-embed-client에서 ParquetReader 가져오기
 try:
-    from qdrant_indexer import ParquetReader
+    from kserve_embed_client import ParquetReader
 except ImportError:
     ParquetReader = None  # ParquetReader 없으면 텍스트 파일만 지원
 
@@ -94,9 +94,9 @@ class _Stats:
         self.total = total
         self.indexed = 0
         self.bulk_ms = 0.0
-        self.retries = 0        # 재시도 발생 횟수
-        self.failed_docs = 0    # 최종 실패 문서 수
-        self.failed_batches = 0 # 최종 실패 배치 수
+        self.retries = 0
+        self.failed_docs = 0
+        self.failed_batches = 0
         self._start = time.perf_counter()
         self._progress = progress
         self._task_id = task_id
@@ -130,7 +130,6 @@ class _Stats:
     def record_failure(self, doc_count: int):
         self.failed_docs += doc_count
         self.failed_batches += 1
-        # Progress bar도 advance (실패 문서를 건너뛰어 100%에 도달)
         self._progress.update(self._task_id, advance=doc_count)
 
     @property
@@ -145,9 +144,9 @@ def _create_progress() -> Progress:
         "[progress.description]{task.description}",
         BarColumn(bar_width=30),
         MofNCompleteColumn(),
-        TextColumn("•"),
+        TextColumn("\u2022"),
         TextColumn("[green]{task.fields[throughput]}[/]"),
-        TextColumn("•"),
+        TextColumn("\u2022"),
         TextColumn("[yellow]bulk={task.fields[last_bulk]}[/]"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
@@ -157,14 +156,10 @@ def _create_progress() -> Progress:
 
 
 # ============================================================
-# Dead Letter Writer — 최종 실패 배치를 JSONL로 기록
+# Dead Letter Writer
 # ============================================================
 class _DeadLetterWriter:
-    """실패 배치를 JSONL 파일에 비동기 안전하게 기록.
-
-    파일 형식 (1줄 = 1 실패 배치):
-        {"batch_id": 1000, "count": 500, "error": "...", "ts": "...", "keywords": [...]}
-    """
+    """실패 배치를 JSONL 파일에 비동기 안전하게 기록."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -190,7 +185,7 @@ class _DeadLetterWriter:
 
 
 # ============================================================
-# 배치 처리 코루틴 — 재시도 + Dead Letter
+# 배치 처리 코루틴
 # ============================================================
 async def _process_batch(
     batch_id: int,
@@ -206,20 +201,19 @@ async def _process_batch(
     async with semaphore:
         last_error: Exception | None = None
 
-        for attempt in range(1, config.max_retries + 2):  # 1 = 최초, 2~N+1 = 재시도
+        for attempt in range(1, config.max_retries + 2):
             try:
                 t0 = time.perf_counter()
                 await indexer.bulk_index(batch_id, keywords)
                 if refresh:
                     await indexer.refresh()
                 stats.update(len(keywords), (time.perf_counter() - t0) * 1000)
-                return  # 성공
+                return
             except Exception as e:
                 last_error = e
                 is_last = attempt > config.max_retries
                 if is_last:
                     break
-                # 지수 백오프: 1s → 2s → 4s → ...
                 delay = config.retry_delay * (2 ** (attempt - 1))
                 stats.record_retry()
                 logger.warning(
@@ -228,7 +222,6 @@ async def _process_batch(
                 )
                 await asyncio.sleep(delay)
 
-        # 모든 재시도 소진 → Dead Letter에 기록
         logger.error(
             f"Batch {batch_id} 최종 실패 ({len(keywords)}건, "
             f"{config.max_retries + 1}회 시도): {last_error}"
@@ -248,7 +241,7 @@ def _summary_table(title: str, rows: list[tuple[str, str]]) -> Table:
 
 
 def _resolve_dead_letter_path(config: Config, log_file: Path) -> Path:
-    """Dead letter 파일 경로 결정. None이면 로그 파일과 같은 디렉토리에 자동 생성."""
+    """Dead letter 파일 경로 결정."""
     if config.dead_letter_path:
         config.dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
         return config.dead_letter_path
@@ -259,7 +252,7 @@ def _build_summary_rows(
     count: int, total: int, wall: float,
     stats: _Stats, dead_letter: _DeadLetterWriter,
 ) -> list[tuple[str, str]]:
-    """요약 테이블 행 생성. 재시도/실패가 있으면 추가 행 포함."""
+    """요약 테이블 행 생성."""
     rows = [
         ("도큐먼트 수", f"{count:,}"),
         ("Wall time", f"{wall:.1f}초"),
@@ -275,19 +268,20 @@ def _build_summary_rows(
 
 
 # ============================================================
-# Bulk 파이프라인
+# 데이터 로드 헬퍼
 # ============================================================
-async def _run_bulk(config: Config, log_path: Path | None = None):
-    log_file = _setup_logger(config, log_path, "es_bulk")
-    logger.info(f"Log → {log_file}")
+def _load_keywords(config: Config) -> tuple[list[str], str]:
+    """Config에 따라 Parquet 또는 텍스트 파일에서 키워드를 로드.
 
-    # [1/4] 키워드 로드
-    logger.info("[1/4] 키워드 로드")
-
+    Returns:
+        (keywords, source_description)
+    """
     if config.parquet_path:
-        # Parquet 파일 또는 디렉토리 읽기
         if ParquetReader is None:
-            raise ImportError("Parquet 지원을 위해 qdrant_indexer 패키지가 필요합니다")
+            raise ImportError(
+                "Parquet 지원을 위해 kserve-embed-client 패키지가 필요합니다: "
+                "pip install kserve-embed-client"
+            )
         reader = ParquetReader(
             config.parquet_path,
             chunk_size=config.parquet_chunk_size,
@@ -297,18 +291,30 @@ async def _run_bulk(config: Config, log_path: Path | None = None):
         keywords = []
         for _, chunk_keywords in reader.iter_chunks():
             keywords.extend(chunk_keywords)
-        total = len(keywords)
         source = f"Parquet: {config.parquet_path.name}"
         if config.parquet_path.is_dir():
             source += f" ({len(reader.parquet_files)} files)"
-        logger.info(f"{source} → {total:,}건 로드 완료")
     else:
-        # 텍스트 파일 읽기 (기존 방식)
         keywords = config.keywords_path.read_text(encoding="utf-8").strip().split("\n")
         if config.limit > 0:
             keywords = keywords[: config.limit]
-        total = len(keywords)
-        logger.info(f"텍스트 파일: {config.keywords_path.name} → {total:,}건 로드 완료")
+        source = f"텍스트 파일: {config.keywords_path.name}"
+
+    return keywords, source
+
+
+# ============================================================
+# Bulk 파이프라인
+# ============================================================
+async def _run_bulk(config: Config, log_path: Path | None = None):
+    log_file = _setup_logger(config, log_path, "es_bulk")
+    logger.info(f"Log \u2192 {log_file}")
+
+    # [1/4] 키워드 로드
+    logger.info("[1/4] 키워드 로드")
+    keywords, source = _load_keywords(config)
+    total = len(keywords)
+    logger.info(f"{source} \u2192 {total:,}건 로드 완료")
 
     # [2/4] ES 인덱스 재생성
     schema_label = "custom" if config.schema else "default"
@@ -367,36 +373,13 @@ async def _run_bulk(config: Config, log_path: Path | None = None):
 # ============================================================
 async def _run_realtime(config: Config, log_path: Path | None = None):
     log_file = _setup_logger(config, log_path, "es_realtime")
-    logger.info(f"Log → {log_file}")
+    logger.info(f"Log \u2192 {log_file}")
 
     # [1/4] 키워드 로드
     logger.info("[1/4] 키워드 로드")
-
-    if config.parquet_path:
-        # Parquet 파일 또는 디렉토리 읽기
-        if ParquetReader is None:
-            raise ImportError("Parquet 지원을 위해 qdrant_indexer 패키지가 필요합니다")
-        reader = ParquetReader(
-            config.parquet_path,
-            chunk_size=config.parquet_chunk_size,
-            text_column=config.parquet_text_column,
-            limit=config.limit,
-        )
-        keywords = []
-        for _, chunk_keywords in reader.iter_chunks():
-            keywords.extend(chunk_keywords)
-        total = len(keywords)
-        source = f"Parquet: {config.parquet_path.name}"
-        if config.parquet_path.is_dir():
-            source += f" ({len(reader.parquet_files)} files)"
-        logger.info(f"{source} → {total:,}건 로드 완료")
-    else:
-        # 텍스트 파일 읽기 (기존 방식)
-        keywords = config.keywords_path.read_text(encoding="utf-8").strip().split("\n")
-        if config.limit > 0:
-            keywords = keywords[: config.limit]
-        total = len(keywords)
-        logger.info(f"텍스트 파일: {config.keywords_path.name} → {total:,}건 로드 완료")
+    keywords, source = _load_keywords(config)
+    total = len(keywords)
+    logger.info(f"{source} \u2192 {total:,}건 로드 완료")
 
     # [2/4] ES 인덱스 보존
     schema_label = "custom" if config.schema else "default"
@@ -454,7 +437,7 @@ async def _run_realtime(config: Config, log_path: Path | None = None):
     if sample:
         results = await indexer.search(sample, size=3)
         hits = results["hits"]["hits"]
-        logger.info(f"실시간 검색 확인 — 쿼리: {sample}")
+        logger.info(f"실시간 검색 확인 \u2014 쿼리: {sample}")
         for hit in hits:
             logger.info(f"  score={hit['_score']:.4f}  {hit['_source']['keyword']}")
 
@@ -469,7 +452,7 @@ def run_indexing(config: Config, log_path: Path | None = None):
     """Bulk 모드 — 인덱스 재생성 후 대량 적재"""
     console.print(
         Panel.fit(
-            "[bold]Bulk 모드[/] — 인덱스 재생성 + 대량 적재",
+            "[bold]Bulk 모드[/] \u2014 인덱스 재생성 + 대량 적재",
             border_style="green",
         )
     )
@@ -480,7 +463,7 @@ def run_realtime(config: Config, log_path: Path | None = None):
     """Realtime 모드 — 기존 인덱스 보존 + 즉시 리프레시"""
     console.print(
         Panel.fit(
-            "[bold]Realtime 모드[/] — 인덱스 보존 + 즉시 리프레시",
+            "[bold]Realtime 모드[/] \u2014 인덱스 보존 + 즉시 리프레시",
             border_style="blue",
         )
     )

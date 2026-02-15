@@ -1,15 +1,10 @@
-# ── Core ──
-numpy
-requests
-rich>=13.0
-elasticsearch[async]>=8.0
-qdrant-client>=1.7
-
-# ── Data ──
-pyarrow                     # Parquet 파일 지원 (--parquet 사용 시 필요)
-
-# ── Model Serving (KServe + ONNX) ──
-torch>=2.0
-transformers>=4.36
-onnxruntime
-kserve
+# DEPRECATED: 이 파일은 pyproject.toml workspace로 대체되었습니다.
+#
+# 설치 방법:
+#   uv sync                       # 전체 workspace (권장)
+#   pip install -e packages/kserve-embed-client
+#   pip install -e packages/qdrant-indexer
+#   pip install -e packages/es-indexer
+#
+# 서빙 의존성 (KServe + ONNX)은 별도 설치:
+#   pip install torch>=2.0 transformers>=4.36 onnxruntime kserve

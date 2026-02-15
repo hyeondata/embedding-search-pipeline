@@ -1,5 +1,5 @@
 """
-es_indexer — Elasticsearch 벌크/실시간 인덱싱 패키지
+es-indexer — Elasticsearch 벌크/실시간 인덱싱 패키지
 
 Bulk 모드 (초기 대량 적재):
     from es_indexer import Config, run_indexing
